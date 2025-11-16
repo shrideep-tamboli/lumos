@@ -104,13 +104,32 @@ export default function Home() {
   setShowClaimsPanel(false);
   
   try {
-    // 1. First call to reclaimify
+    // 1. Extract text from URL (handles both regular URLs and YouTube URLs)
     setLoadingState(prev => ({ ...prev, step1: true }));
-    const reclaimifyResponse = await fetch(`/api/reclaimify?url=${encodeURIComponent(url.trim())}&categorize=true&disambiguate=true`);
+    const extractResponse = await fetch(`/api/extract?url=${encodeURIComponent(url.trim())}`);
+    
+    if (!extractResponse.ok) {
+      const errorData = await extractResponse.json().catch(() => ({}));
+      throw new Error(errorData.error || 'Failed to extract content from URL');
+    }
+    
+    const extractData = await extractResponse.json();
+    
+    // 2. Send extracted content to reclaimify for processing (works for both regular URLs and YouTube URLs)
+    const reclaimifyResponse = await fetch('/api/reclaimify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: extractData.url || url.trim(),
+        content: extractData.content,
+        title: extractData.title,
+        excerpt: extractData.excerpt
+      })
+    });
     
     if (!reclaimifyResponse.ok) {
       const errorData = await reclaimifyResponse.json().catch(() => ({}));
-      throw new Error(errorData.error || 'Failed to process URL');
+      throw new Error(errorData.error || 'Failed to process content');
     }
     
     const reclaimifyData: ReclaimifyApiResponse = await reclaimifyResponse.json();
@@ -118,7 +137,7 @@ export default function Home() {
     setResult({ url: reclaimifyData.url || url.trim(), content: reclaimifyData.content || '' });
     setActiveTab('summary'); // Switch to Analysis Summary tab after getting reclaimify data
 
-    // 2. Build verifiable claims from new API shape first, fallback to old
+    // 3. Build verifiable claims from new API shape first, fallback to old
     const verifiableFromArray = Array.isArray(reclaimifyData.verifiableClaims)
       ? reclaimifyData.verifiableClaims.filter((s) => typeof s === 'string' && s.trim().length > 0)
       : [];
@@ -165,7 +184,7 @@ export default function Home() {
       totalClaims: claimsData.claims.length
     }));
 
-    // 3. Call websearch
+    // 4. Call websearch
     setLoadingState(prev => ({ ...prev, step1: false, step2: true }));
     const webSearchResponse = await fetch('/api/websearch', {
       method: 'POST',
@@ -197,7 +216,7 @@ export default function Home() {
       });
     });
 
-    // 4. Call batch analysis with URLs and claims
+    // 5. Call batch analysis with URLs and claims
     setLoadingState(prev => ({ ...prev, step2: false, step3: true }));
     
     if (flattenedUrls.length === 0) {
@@ -235,7 +254,7 @@ export default function Home() {
       }
     });
 
-    // 5. Call fact check with claims and their associated content
+    // 6. Call fact check with claims and their associated content
     setLoadingState(prev => ({ ...prev, step3: false, step4: true }));
     
     const factCheckClaims = Object.entries(contentsByClaim).map(([claim, content]) => ({

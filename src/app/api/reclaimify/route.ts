@@ -1,7 +1,4 @@
 import { NextResponse } from 'next/server';
-import axios from 'axios';
-import * as cheerio from 'cheerio';
-import { extract } from '@extractus/article-extractor';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // Initialize Google Generative AI
@@ -21,84 +18,59 @@ interface ProcessedSentence {
   finalClaim?: string; // The ultimate claim to fact-check
 }
 
-// --- Helper: Clean extracted text ---
-function cleanText(html: string): string {
-  return html
-    .replace(/<[^>]*>/g, ' ') // Remove HTML tags
-    .replace(/\s+/g, ' ')     // Collapse whitespace
-    .trim();
+// --- Helper: Detect if text is primarily in Hindi (Devanagari script) ---
+function isHindiText(text: string): boolean {
+  if (!text || text.trim().length === 0) return false;
+  
+  // Devanagari script Unicode range: U+0900 to U+097F
+  // Check if text contains Devanagari characters
+  const devanagariPattern = /[\u0900-\u097F]/g;
+  const devanagariMatches = text.match(devanagariPattern);
+  const devanagariCount = devanagariMatches ? devanagariMatches.length : 0;
+  
+  // If no Devanagari characters found, it's not Hindi
+  if (devanagariCount === 0) return false;
+  
+  // Count all non-whitespace, non-punctuation characters (both Devanagari and Latin)
+  const allLetters = text.match(/[\u0900-\u097Fa-zA-Z]/g);
+  const totalLetterCount = allLetters ? allLetters.length : 0;
+  
+  // If we have significant Devanagari characters, check the ratio
+  if (totalLetterCount === 0) {
+    // Edge case: only punctuation/whitespace, but if we have Devanagari, it's likely Hindi
+    return devanagariCount >= 5;
+  }
+  
+  const devanagariRatio = devanagariCount / totalLetterCount;
+  
+  // If more than 15% of letters are Devanagari, OR if we have 20+ Devanagari chars, consider it Hindi
+  // Lower threshold to catch more Hindi text
+  return devanagariRatio > 0.15 || devanagariCount >= 20;
 }
 
-// --- Helper: Extract article text ---
-async function extractArticleText(url: string): Promise<{
-  content: string;
-  title?: string;
-  excerpt?: string;
-  source: 'article-extractor' | 'fallback';
-}> {
-  try {
-    // First try with article-extractor
-    const article = await extract(url);
-    if (article?.content) {
-      return {
-        content: cleanText(article.content),
-        title: article.title,
-        excerpt: article.description,
-        source: 'article-extractor',
-      };
-    }
-  } catch (error) {
-    console.error('Error with article-extractor:', error);
-  }
-
-  // Fallback to cheerio for basic extraction
-  try {
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      },
-      timeout: 10000,
+// --- Helper: Split Hindi text into sentences ---
+function splitHindiIntoSentences(text: string): string[] {
+  // Hindi uses '।' (Danda/U+0964) as sentence end marker, along with ? and !
+  // Also handle English punctuation (., !, ?) that might be mixed in
+  // Split on: । (Danda), . (period), ? (question mark), ! (exclamation mark)
+  // Pattern: Look for sentence end markers followed by whitespace or end of string
+  return text
+    .split(/(?<=[।.!?])\s+|(?<=[।.!?])$/gm) // Split at Hindi Danda (।), English period (.), !, ?
+    .map(s => s.trim())
+    .filter(s => s.length > 0 && s.length < 500) // Filter out very long or empty sentences
+    .filter(s => {
+      // Remove sentences that are only punctuation/whitespace
+      const withoutPunctuation = s.replace(/[।.!?\s\u0900-\u097F]/g, '');
+      // Keep if it has non-Devanagari content OR if it has Devanagari characters
+      const hasDevanagari = /[\u0900-\u097F]/.test(s);
+      const hasContent = s.replace(/[।.!?\s]/g, '').length > 0;
+      return hasContent && (hasDevanagari || withoutPunctuation.length > 0);
     });
-
-    const $ = cheerio.load(response.data);
-    
-    // Try to get main content
-    let content = '';
-    const selectors = [
-      'article',
-      'main',
-      '[role="main"]',
-      '.post-content',
-      '.article-content',
-      '.entry-content',
-      'body',
-    ];
-
-    for (const selector of selectors) {
-      const element = $(selector).first();
-      if (element.length > 0) {
-        content = element.text();
-        if (content.length > 100) break; // Found substantial content
-      }
-    }
-
-    return {
-      content: cleanText(content || response.data),
-      title: $('title').first().text().trim(),
-      excerpt: $('meta[property="og:description"]').attr('content') || 
-               $('meta[name="description"]').attr('content') ||
-               $('p').first().text().substring(0, 200) + '...',
-      source: 'fallback',
-    };
-  } catch (error) {
-    console.error('Error with fallback extraction:', error);
-    throw new Error('Failed to extract content from the provided URL');
-  }
 }
 
-// --- Helper: Split text into sentences ---
-function splitIntoSentences(text: string): string[] {
-  // Simple sentence splitting that handles common cases
+// --- Helper: Split English text into sentences ---
+function splitEnglishIntoSentences(text: string): string[] {
+  // Simple sentence splitting that handles common cases for English
   return text
     .split(/(?<=\S[\.!?]\s+)(?=[A-Z])/g) // Split at sentence boundaries (., !, ?)
     .map(s => s.trim())
@@ -106,12 +78,30 @@ function splitIntoSentences(text: string): string[] {
     .filter(s => !/^[\s\d\W]+$/.test(s)); // Filter out sentences with only numbers/symbols
 }
 
+// --- Helper: Split text into sentences (auto-detects language) ---
+function splitIntoSentences(text: string): string[] {
+  // Detect language and use appropriate splitting method
+  if (isHindiText(text)) {
+    console.log('Detected Hindi text, using Hindi sentence splitting');
+    return splitHindiIntoSentences(text);
+  } else {
+    console.log('Detected English text, using English sentence splitting');
+    return splitEnglishIntoSentences(text);
+  }
+}
+
 // --- SINGLE LLM CALL: Process all sentences at once ---
 async function processAllSentences(sentences: string[]): Promise<ProcessedSentence[]> {
   try {
     const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
     
-    const prompt = `You are an expert fact-checking assistant with deep knowledge of English grammar, semantics, and logical reasoning. Your task is to process sentences through a multi-step pipeline to extract verifiable factual claims.
+    // Detect if sentences contain Hindi text
+    const hasHindi = sentences.some(s => /[\u0900-\u097F]/.test(s));
+    const languageNote = hasHindi 
+      ? '\n\n⚠️ IMPORTANT: The input sentences contain Hindi text (Devanagari script). Apply the same categorization rules to Hindi sentences as you would to English. Process Hindi sentences exactly the same way - look for verifiable facts, specific dates, proper nouns, quantifiable data, etc. The principles of verifiability are language-independent.\n'
+      : '';
+    
+    const prompt = `You are an expert fact-checking assistant with deep knowledge of English and Hindi grammar, semantics, and logical reasoning. Your task is to process sentences through a multi-step pipeline to extract verifiable factual claims. You can process text in English, Hindi (Devanagari script), or mixed languages.${languageNote}
 
 ═══════════════════════════════════════════════════════════════
 CORE PRINCIPLES
@@ -128,38 +118,38 @@ STEP 1: CATEGORIZATION RULES
 ═══════════════════════════════════════════════════════════════
 
 **VERIFIABLE** - Contains specific, objective, falsifiable claims:
-✓ Proper nouns with specific facts: "Apple released the iPhone in 2007"
-✓ Measurable quantities: "The building is 500 feet tall"
-✓ Specific dates/times: "The meeting occurred on March 15, 2023"
-✓ Documented events: "The treaty was signed in Paris"
-✓ Quantifiable data: "The company's revenue was $50 million"
-✓ Concrete actions: "The CEO resigned on Tuesday"
-✓ Scientific facts: "Water boils at 100°C at sea level"
-✓ Historical events: "World War II ended in 1945"
-✓ Legal facts: "The law was passed by Congress"
-✓ Geographic facts: "Mount Everest is in the Himalayas"
+✓ Proper nouns with specific facts: "Apple released the iPhone in 2007" OR "एप्पल ने 2007 में iPhone जारी किया"
+✓ Measurable quantities: "The building is 500 feet tall" OR "इमारत 500 फीट ऊंची है"
+✓ Specific dates/times: "The meeting occurred on March 15, 2023" OR "बैठक 15 मार्च 2023 को हुई"
+✓ Documented events: "The treaty was signed in Paris" OR "संधि पेरिस में हस्ताक्षरित हुई"
+✓ Quantifiable data: "The company's revenue was $50 million" OR "कंपनी का राजस्व $50 मिलियन था"
+✓ Concrete actions: "The CEO resigned on Tuesday" OR "सीईओ ने मंगलवार को इस्तीफा दिया"
+✓ Scientific facts: "Water boils at 100°C at sea level" OR "समुद्र तल पर पानी 100°C पर उबलता है"
+✓ Historical events: "World War II ended in 1945" OR "द्वितीय विश्व युद्ध 1945 में समाप्त हुआ"
+✓ Legal facts: "The law was passed by Congress" OR "कानून संसद द्वारा पारित किया गया"
+✓ Geographic facts: "Mount Everest is in the Himalayas" OR "माउंट एवरेस्ट हिमालय में है"
 
 **PARTIALLY VERIFIABLE** - Mix of verifiable facts and subjective elements:
-⚠ Verifiable core + subjective modifiers: "The amazing discovery was made in 2020"
-⚠ Facts with opinions: "The poorly designed bridge collapsed in 2019"
-⚠ Verifiable claims with hedging: "Some say the company was founded in 1995"
-⚠ Attributions with facts: "According to sources, the event happened yesterday"
-⚠ Comparative judgments with facts: "The faster processor was released in Q2"
-⚠ Emotional descriptions with facts: "The shocking announcement came on Monday"
+⚠ Verifiable core + subjective modifiers: "The amazing discovery was made in 2020" OR "अद्भुत खोज 2020 में की गई"
+⚠ Facts with opinions: "The poorly designed bridge collapsed in 2019" OR "खराब डिज़ाइन वाला पुल 2019 में ढह गया"
+⚠ Verifiable claims with hedging: "Some say the company was founded in 1995" OR "कुछ लोग कहते हैं कि कंपनी 1995 में स्थापित हुई"
+⚠ Attributions with facts: "According to sources, the event happened yesterday" OR "सूत्रों के अनुसार, घटना कल हुई"
+⚠ Comparative judgments with facts: "The faster processor was released in Q2" OR "तेज़ प्रोसेसर Q2 में जारी किया गया"
+⚠ Emotional descriptions with facts: "The shocking announcement came on Monday" OR "चौंकाने वाली घोषणा सोमवार को आई"
 
 **NOT VERIFIABLE** - Subjective, opinion-based, or too vague:
-✗ Pure opinions: "This is the best product ever"
-✗ Subjective experiences: "I feel that this is important"
-✗ Value judgments: "The movie was entertaining"
-✗ Predictions: "The stock will rise tomorrow"
-✗ Hypotheticals: "If he had won, things would be different"
-✗ Vague generalizations: "Many people believe this"
-✗ Aesthetic judgments: "The painting is beautiful"
-✗ Moral claims: "This action was wrong"
-✗ Indefinite statements: "Something happened somewhere"
-✗ Questions: "What is the capital of France?"
-✗ Commands: "Please verify this information"
-✗ Future intentions: "We plan to expand next year"
+✗ Pure opinions: "This is the best product ever" OR "यह अब तक का सबसे अच्छा उत्पाद है"
+✗ Subjective experiences: "I feel that this is important" OR "मुझे लगता है कि यह महत्वपूर्ण है"
+✗ Value judgments: "The movie was entertaining" OR "फिल्म मनोरंजक थी"
+✗ Predictions: "The stock will rise tomorrow" OR "शेयर कल बढ़ेगा"
+✗ Hypotheticals: "If he had won, things would be different" OR "अगर वह जीत जाता, तो चीजें अलग होतीं"
+✗ Vague generalizations: "Many people believe this" OR "कई लोग यह मानते हैं"
+✗ Aesthetic judgments: "The painting is beautiful" OR "पेंटिंग सुंदर है"
+✗ Moral claims: "This action was wrong" OR "यह कार्रवाई गलत थी"
+✗ Indefinite statements: "Something happened somewhere" OR "कहीं कुछ हुआ"
+✗ Questions: "What is the capital of France?" OR "फ्रांस की राजधानी क्या है?"
+✗ Commands: "Please verify this information" OR "कृपया इस जानकारी को सत्यापित करें"
+✗ Future intentions: "We plan to expand next year" OR "हम अगले साल विस्तार की योजना बना रहे हैं"
 
 ═══════════════════════════════════════════════════════════════
 STEP 2: REWRITING GUIDELINES (Partially Verifiable Only)
@@ -304,6 +294,16 @@ Output: {
   "categoryReasoning": "Specific company, product, and date - all objectively verifiable",
   "isAmbiguous": false,
   "finalClaim": "Apple Inc. released the iPhone 15 on September 22, 2023"
+}
+
+EXAMPLE 4B - Verifiable Hindi Sentence:
+Input: "भारत ने 15 अगस्त 1947 को आज़ादी प्राप्त की"
+Output: {
+  "originalSentence": "भारत ने 15 अगस्त 1947 को आज़ादी प्राप्त की",
+  "category": "Verifiable",
+  "categoryReasoning": "Specific country, date, and event - all objectively verifiable",
+  "isAmbiguous": false,
+  "finalClaim": "भारत ने 15 अगस्त 1947 को आज़ादी प्राप्त की"
 }
 
 EXAMPLE 5 - Partially Verifiable, Nothing Remains:
@@ -477,55 +477,48 @@ export async function GET(request: Request) {
 
   if (!url) {
     return NextResponse.json(
-      { error: 'URL parameter is required' },
+      { error: 'URL parameter is required. Please use POST method with content in the body, or use /api/extract first.' },
       { status: 400 }
     );
   }
 
-  try {
-    const { content, title, excerpt } = await extractArticleText(url);
-    const sentences = splitIntoSentences(content);
-    
-    // Process all sentences in ONE LLM call
-    const processed = await processAllSentences(sentences);
-    
-    // Extract only the final verifiable claims
-    const verifiableClaims = processed
-      .filter(p => p.finalClaim !== null && p.finalClaim !== undefined && p.finalClaim.trim().length > 0)
-      .map(p => p.finalClaim as string);
-
-    return NextResponse.json({
-      url,
-      title,
-      excerpt,
-      content,
-      sentences,
-      processedSentences: processed,
-      verifiableClaims,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    console.error('Error processing URL:', error);
-    return NextResponse.json(
-      { error: 'Failed to process the URL', details: error instanceof Error ? error.message : 'Unknown error' },
-      { status: 500 }
-    );
-  }
+  // GET method is deprecated - redirect to using POST with extracted content
+  return NextResponse.json(
+    { 
+      error: 'GET method is no longer supported. Please extract content using /api/extract first, then POST to /api/reclaimify with the content.',
+      message: 'Use POST method with { content, url, title?, excerpt? } in the request body'
+    },
+    { status: 405 }
+  );
 }
 
 export async function POST(request: Request) {
   try {
-    const { url } = await request.json();
+    const body = await request.json();
+    const { url, content, title, excerpt } = body;
 
-    if (!url) {
+    // Content must be provided - extraction is now handled by /api/extract
+    if (!content || typeof content !== 'string') {
       return NextResponse.json(
-        { error: 'URL is required in the request body' },
+        { error: 'Content is required in the request body. Please extract content using /api/extract first.' },
         { status: 400 }
       );
     }
 
-    const { content, title, excerpt } = await extractArticleText(url);
+    if (content.trim().length === 0) {
+      return NextResponse.json(
+        { error: 'Content is empty or invalid' },
+        { status: 400 }
+      );
+    }
+
+    // Split text into sentences here (moved from frontend)
+    // Log language detection for debugging
+    const isHindi = isHindiText(content);
+    console.log(`Language detection: ${isHindi ? 'Hindi' : 'English'} (content length: ${content.length}, first 100 chars: ${content.substring(0, 100)})`);
+    
     const sentences = splitIntoSentences(content);
+    console.log(`Split into ${sentences.length} sentences`);
     
     // Process all sentences in ONE LLM call
     const processed = await processAllSentences(sentences);
@@ -536,10 +529,10 @@ export async function POST(request: Request) {
       .map(p => p.finalClaim as string);
 
     return NextResponse.json({
-      url,
-      title,
-      excerpt,
-      content,
+      url: url || 'unknown',
+      title: title,
+      excerpt: excerpt,
+      content: content,
       sentences,
       processedSentences: processed,
       verifiableClaims,

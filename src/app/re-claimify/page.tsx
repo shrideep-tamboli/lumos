@@ -54,10 +54,29 @@ function ReclaimifyContent() {
       setIsLoading(true);
       setError(null);
       
-      const response = await fetch(`/api/reclaimify?url=${encodeURIComponent(url)}&categorize=true&disambiguate=true`);
+      // First extract content from URL
+      const extractResponse = await fetch(`/api/extract?url=${encodeURIComponent(url)}`);
+      
+      if (!extractResponse.ok) {
+        throw new Error('Failed to extract content from URL');
+      }
+      
+      const extractData = await extractResponse.json();
+      
+      // Then send extracted content to reclaimify
+      const response = await fetch('/api/reclaimify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: extractData.url || url,
+          content: extractData.content,
+          title: extractData.title,
+          excerpt: extractData.excerpt
+        })
+      });
       
       if (!response.ok) {
-        throw new Error('Failed to fetch content');
+        throw new Error('Failed to process content');
       }
       
       const data = await response.json();
@@ -134,14 +153,25 @@ function ReclaimifyContent() {
     try {
       setIsProcessing(true);
       
+      // First extract content from URL
+      const extractResponse = await fetch(`/api/extract?url=${encodeURIComponent(url)}`);
+      
+      if (!extractResponse.ok) {
+        throw new Error('Failed to extract content from URL');
+      }
+      
+      const extractData = await extractResponse.json();
+      
+      // Then send extracted content to reclaimify
       const response = await fetch('/api/reclaimify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          url, 
-          categorize: true,
-          disambiguate: true 
-        }),
+        body: JSON.stringify({
+          url: extractData.url || url,
+          content: extractData.content,
+          title: extractData.title,
+          excerpt: extractData.excerpt
+        })
       });
 
       if (!response.ok) {
