@@ -235,7 +235,7 @@ async function handleAnalysis(data, tab) {
     
     // Process fact-checking in batches of 2 claims at a time (reduced from 3)
     // This significantly reduces embedding generation and prevents timeouts
-    const FACT_CHECK_BATCH_SIZE = 2;
+    const FACT_CHECK_BATCH_SIZE = 5;
     
     if (factCheckClaims.length > 0) {
       for (let i = 0; i < factCheckClaims.length; i += FACT_CHECK_BATCH_SIZE) {
@@ -299,11 +299,6 @@ async function handleAnalysis(data, tab) {
             totalTrustScore += 50;
             trustScoreCount++;
           });
-        }
-        
-        // Add a small delay between batches to avoid overwhelming the API
-        if (i + FACT_CHECK_BATCH_SIZE < factCheckClaims.length) {
-          await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
         }
       }
       

@@ -45,7 +45,7 @@ async function generateEmbedding(text: string): Promise<number[]> {
   if (!text.trim()) return [];
   try {
     console.log(`Generating embedding for text (${text.length} chars)`);
-    await rateLimit();
+    //await rateLimit();
     const resp = await timeout(ai.models.embedContent({ 
       model: "text-embedding-004", 
       contents: text 
@@ -88,7 +88,11 @@ async function getTopSentences(claim: string, text: string, maxSentences: number
   if (!text?.trim()) return [];
   
   const sentences = splitIntoSentences(text);
-  if (sentences.length <= maxSentences) return sentences;
+  // Skip embeddings if content is already short (huge performance win!)
+  if (sentences.length <= maxSentences * 2) {
+    console.log(`⚡ Skipping embeddings - content already short (${sentences.length} sentences)`);
+    return sentences.slice(0, maxSentences);
+  }
   
   try {
     // Get embeddings for claim and all sentences in a single batch
@@ -206,12 +210,14 @@ export async function POST(request: Request) {
 
 For each claim, provide:
 1. A verdict based on the evidence
+2. A concise reason (1-3 sentences) explaining how the evidence leads to the verdict
 2. The most relevant quotes supporting your verdict
 3. A trust score based on the strength of evidence
 
 Strictly output a JSON array where each element has these keys:
 - claim: The original claim text
 - Verdict: One of ["Support","Partially Support","Unclear","Contradict","Refute"]
+- Reason: Short textual justification for the verdict referencing the evidence
 - Reference: Array of 1-3 exact quotes from the evidence (include source numbers like [Source 1])
 - Trust_Score: Number from 0-100 based on evidence strength
   - 100: Strong support with multiple reliable sources
@@ -224,6 +230,7 @@ Format example:
   {
     "claim": "Example claim",
     "Verdict": "Support",
+    "Reason": "Explain which sources support the verdict.",
     "Reference": ["[Source 1] Supporting evidence quote."],
     "Trust_Score": 85
   }
@@ -233,12 +240,13 @@ Format example:
     interface ParsedItem {
       claim?: string;
       Verdict?: string;
+      Reason?: string | null;
       Reference?: string | string[] | null;
       Trust_Score?: number;
       [key: string]: unknown;
     }
 
-    function normalizeResults(parsed: ParsedItem[]): Array<{claim: string; Verdict: string; Reference: string[]; Trust_Score: number}> {
+    function normalizeResults(parsed: ParsedItem[]): Array<{claim: string; Verdict: string; Reason: string; Reference: string[]; Trust_Score: number}> {
       const normalize = (v: string) => (v || '').trim().toLowerCase();
       
       const scoreFor = (v: string): number => {
@@ -258,6 +266,9 @@ Format example:
         return {
           claim: item.claim || 'Unknown claim',
           Verdict: isValidVerdict ? verdict : 'Unclear',
+          Reason: typeof item.Reason === 'string'
+            ? item.Reason.trim()
+            : '',
           Reference: Array.isArray(item.Reference) 
             ? (item.Reference as string[]).filter((ref): ref is string => ref != null).map(String) 
             : item.Reference 
@@ -296,6 +307,11 @@ Format example:
                     type: Type.STRING,
                     enum: ["Support", "Partially Support", "Unclear", "Contradict", "Refute"]
                   },
+                  Reason: {
+                    type: Type.STRING,
+                    minLength: 1,
+                    maxLength: 600
+                  },
                   Reference: { 
                     type: Type.ARRAY, 
                     items: { type: Type.STRING },
@@ -308,7 +324,7 @@ Format example:
                     maximum: 100
                   },
                 },
-                required: ["claim", "Verdict", "Reference", "Trust_Score"],
+                required: ["claim", "Verdict", "Reason", "Reference", "Trust_Score"],
                 additionalProperties: false
               }
             }
@@ -335,6 +351,7 @@ Format example:
           batchResults.push({
             claim: claim || 'Unknown claim',
             Verdict: "Unclear",
+            Reason: "Error processing claim",
             Reference: ["Error processing claim"],
             Trust_Score: 0
           });

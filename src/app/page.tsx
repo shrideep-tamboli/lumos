@@ -309,6 +309,7 @@ export default function Home() {
       return {
         ...representative,
         verdict: fc?.verdict || fc?.Verdict,
+        reason: fc?.reason || fc?.Reason,
         reference: fc?.reference || fc?.Reference,
         trustScore: typeof fc?.trustScore === 'number' ? fc.trustScore :
                     typeof fc?.Trust_Score === 'number' ? fc.Trust_Score :
@@ -515,6 +516,7 @@ export default function Home() {
           relevantChunks: group.flatMap((g: SearchResult & { relevantChunks?: RelevantChunk[] }) => g.relevantChunks || []),
           // Map the fact-check fields to the expected case
           verdict: fc?.verdict || fc?.Verdict, // Try both cases
+          reason: fc?.reason || fc?.Reason,
           reference: fc?.reference || fc?.Reference,
           trustScore: typeof fc?.trustScore === 'number' ? fc.trustScore : 
                      typeof fc?.Trust_Score === 'number' ? fc.Trust_Score :

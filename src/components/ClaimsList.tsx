@@ -18,6 +18,15 @@ return (
               <div className="flex-1">
                 <p className="text-gray-900 font-medium">Claim: {claim.claim}</p>
                 {(() => {
+                  const reason = result.reason ?? result.Reason;
+                  if (!reason) return null;
+                  return (
+                    <p className="mt-1 text-sm text-gray-700">
+                      <span className="font-medium">Reason:</span> {reason}
+                    </p>
+                  );
+                })()}
+                {(() => {
                   const ref = result.reference ?? result.Reference;
                   if (!ref) return null;
                   if (Array.isArray(ref)) {

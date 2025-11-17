@@ -13,6 +13,8 @@ export interface SearchResult {
   // Support both camelCase and PascalCase for API response fields
   verdict?: "Support" | "Partially Support" | "Unclear" | "Contradict" | "Refute";
   Verdict?: "Support" | "Partially Support" | "Unclear" | "Contradict" | "Refute";
+  reason?: string;
+  Reason?: string;
   reference?: string;
   Reference?: string | string[];
   trustScore?: number;
@@ -98,6 +100,8 @@ export interface FactCheckResult {
   claim: string;
   verdict?: "Support" | "Partially Support" | "Unclear" | "Contradict" | "Refute";
   Verdict?: "Support" | "Partially Support" | "Unclear" | "Contradict" | "Refute";
+  reason?: string;
+  Reason?: string;
   reference?: string | string[];
   Reference?: string | string[];
   trustScore?: number;

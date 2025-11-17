@@ -158,8 +158,8 @@ export async function POST(request: Request) {
     }
 
     // Process all URLs in parallel with concurrency control
-    const CONCURRENCY_LIMIT = 10; // Number of concurrent requests
-    const REQUEST_TIMEOUT = 30000; // 30 seconds timeout per request
+    const CONCURRENCY_LIMIT = 20; // Number of concurrent requests
+    const REQUEST_TIMEOUT = 15000; // 15 seconds timeout per request
     
     // Process URLs in parallel with concurrency control
     const processUrl = async (item: { url: string; claim?: string }): Promise<ExtractContentResult> => {
@@ -188,7 +188,7 @@ export async function POST(request: Request) {
     };
     
     // Process all URLs with controlled concurrency
-    const CONCURRENCY = 10; // Number of concurrent requests
+    const CONCURRENCY = 20; // Number of concurrent requests
     const results: ExtractContentResult[] = [];
     
     // Process URLs in chunks with controlled concurrency
