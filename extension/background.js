@@ -1,3 +1,511 @@
+// Background service worker for fact-checking with backend integration
+
+console.log("🔍 Trust Score Analyzer: Background worker loaded");
+
+// Backend API base URL - change this to your deployed URL or keep localhost:3000 for development
+const API_BASE_URL = 'http://localhost:3000';
+
+// Test API connection on startup
+async function testConnection() {
+  try {
+    const response = await fetch(`${API_BASE_URL}/`, { method: 'GET' });
+    if (response.ok) {
+      console.log('✅ Backend connection successful!');
+      return true;
+    }
+  } catch (error) {
+    console.error('❌ Backend connection failed:', error);
+  }
+  return false;
+}
+
+testConnection();
+
+// Listen for analysis requests
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  console.log('📨 Received message:', request.action, 'Data:', request.data);
+  
+  if (request.action === "analyzeArticle") {
+    console.log('🚀 Starting analysis for URL:', request.data.url);
+    handleAnalysis(request.data, sender.tab || request.data.tab);
+    sendResponse({ success: true });
+  }
+  
+  if (request.action === "openReport") {
+    chrome.tabs.create({ url: chrome.runtime.getURL('history.html') });
+    sendResponse({ success: true });
+  }
+  
+  return true;
+});
+
+// Main analysis handler using backend APIs
+async function handleAnalysis(data, tab) {
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("📊 STARTING ARTICLE ANALYSIS (Backend Mode)");
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log(`📰 Title: ${data.title}`);
+  console.log(`🔗 URL: ${data.url}`);
+  console.log(`🌐 Domain: ${data.domain}`);
+  console.log("");
+  
+  // Declare variables at function scope to avoid undefined errors
+  let extractData = null;
+  let reclaimifyData = null;
+  
+  try {
+    // Step 1: Extract content from URL using /api/extract
+    console.log("STEP 1: Extracting content from URL...");
+    console.log(`🔗 Calling: ${API_BASE_URL}/api/extract`);
+    
+    const extractResponse = await fetch(
+      `${API_BASE_URL}/api/extract?url=${encodeURIComponent(data.url)}`
+    ).catch(err => {
+      console.error("❌ Fetch error for extract:", err);
+      throw new Error(`Failed to fetch: ${err.message}`);
+    });
+    
+    console.log(`📡 Extract response status: ${extractResponse.status}`);
+    
+    if (!extractResponse.ok) {
+      const errorText = await extractResponse.text();
+      console.error(`❌ Extract error response: ${errorText}`);
+      throw new Error('Failed to extract content from URL');
+    }
+    
+    extractData = await extractResponse.json();
+    console.log(`✅ Extracted content (${extractData.content?.length || 0} characters)`);
+    console.log("");
+    
+    // Step 2: Call /api/reclaimify to process content and extract claims
+    console.log("STEP 2: Processing content and extracting verifiable claims...");
+    console.log(`🔗 Calling: ${API_BASE_URL}/api/reclaimify`);
+    
+    const reclaimifyResponse = await fetch(
+      `${API_BASE_URL}/api/reclaimify`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: data.url,
+          content: extractData.content,
+          title: extractData.title,
+          excerpt: extractData.excerpt
+        })
+      }
+    ).catch(err => {
+      console.error("❌ Fetch error for reclaimify:", err);
+      throw new Error(`Failed to fetch: ${err.message}`);
+    });
+    
+    console.log(`📡 Reclaimify response status: ${reclaimifyResponse.status}`);
+    
+    if (!reclaimifyResponse.ok) {
+      const errorText = await reclaimifyResponse.text();
+      console.error(`❌ Reclaimify error response: ${errorText}`);
+      throw new Error('Failed to process URL');
+    }
+    
+    reclaimifyData = await reclaimifyResponse.json();
+    console.log(`✅ Extracted ${reclaimifyData.sentences?.length || 0} sentences`);
+    console.log(`✅ Found ${reclaimifyData.verifiableClaims?.length || 0} verifiable claims`);
+    console.log("");
+    
+    // Use the new verifiableClaims array from the unified API
+    // This contains the final processed claims ready for fact-checking
+    const rawClaims = Array.isArray(reclaimifyData.verifiableClaims) 
+      ? reclaimifyData.verifiableClaims 
+      : [];
+    
+    // Apply additional filtering for quality control
+    const verifiableList = rawClaims.filter((sentence) => {
+      // Filter out short sentences or sentences that are likely excerpts/summaries
+      const trimmed = sentence.trim();
+      if (trimmed.length < 20) return false; // Too short
+      if (trimmed.toLowerCase().startsWith('but she') || 
+          trimmed.toLowerCase().startsWith('but he') ||
+          trimmed.toLowerCase().startsWith('however she') ||
+          trimmed.toLowerCase().startsWith('however he')) {
+        // These are likely contextual follow-ups, not standalone claims
+        return false;
+      }
+      return true;
+    });
+    
+    if (verifiableList.length === 0) {
+      throw new Error('No verifiable claims found in the article');
+    }
+
+    const searchDate = new Date().toISOString().split('T')[0];
+    const claimsData = {
+      claims: verifiableList.map((claim) => ({ claim, search_date: searchDate })),
+      search_date: searchDate,
+    };
+    
+    console.log(`📝 Found ${claimsData.claims.length} verifiable claims`);
+    console.log("");
+    
+    // Step 3: Call /api/websearch to get search results for each claim
+    console.log("STEP 3: Searching for evidence...");
+    const webSearchResponse = await fetch(`${API_BASE_URL}/api/websearch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        claims: claimsData.claims,
+        search_date: searchDate,
+        originalUrl: data.url
+      })
+    });
+
+    if (!webSearchResponse.ok) {
+      throw new Error('Failed to perform web search');
+    }
+    
+    const webSearchData = await webSearchResponse.json();
+    const urlsPerClaim = Array.isArray(webSearchData?.urls) ? webSearchData.urls : [];
+    console.log(`✅ Found search results for ${urlsPerClaim.filter(urls => urls.length > 0).length} claims`);
+    console.log("");
+    
+    // Flatten URLs for batch extraction and create claim mapping
+    const flattenedUrls = [];
+    const claimsOnePerUrl = [];
+    
+    urlsPerClaim.forEach((urls, claimIndex) => {
+      urls.forEach(url => {
+        if (url) {
+          flattenedUrls.push(url);
+          claimsOnePerUrl.push(claimsData.claims[claimIndex]?.claim || '');
+        }
+      });
+    });
+
+    // Step 4: Call /api/analyze/batch to extract content from URLs
+    console.log("STEP 4: Extracting content from search results...");
+    
+    if (flattenedUrls.length === 0) {
+      throw new Error('No valid URLs found for analysis');
+    }
+    
+    const batchResponse = await fetch(`${API_BASE_URL}/api/analyze/batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        urls: flattenedUrls,
+        claims: claimsOnePerUrl
+      })
+    });
+
+    if (!batchResponse.ok) {
+      throw new Error('Failed to analyze content');
+    }
+
+    const batchData = await batchResponse.json();
+    const batchResults = Array.isArray(batchData?.results) ? batchData.results : [];
+    console.log(`✅ Extracted content from ${batchResults.length} sources`);
+    console.log("");
+
+    // Group extracted contents per claim for fact checking
+    const contentsByClaim = {};
+    
+    batchResults.forEach((result) => {
+      const claimKey = (result?.claim || '').toString().trim();
+      const content = (result?.content || '').toString().trim();
+      
+      if (claimKey && content) {
+        if (!contentsByClaim[claimKey]) {
+          contentsByClaim[claimKey] = [];
+        }
+        contentsByClaim[claimKey].push(content);
+      }
+    });
+
+    // Step 5: Call /api/factCheck with claims and their associated content
+    // Process in smaller batches to avoid timeout
+    console.log("STEP 5: Fact-checking claims in batches...");
+    
+    const factCheckClaims = Object.entries(contentsByClaim).map(([claim, content]) => ({
+      claim,
+      content: content.length === 1 ? content[0] : content
+    }));
+
+    let factCheckResults = [];
+    let totalTrustScore = 0;
+    let trustScoreCount = 0;
+    let averageTrustScore = 50; // Default value
+    
+    // Process fact-checking in batches of 2 claims at a time (reduced from 3)
+    // This significantly reduces embedding generation and prevents timeouts
+    const FACT_CHECK_BATCH_SIZE = 2;
+    
+    if (factCheckClaims.length > 0) {
+      for (let i = 0; i < factCheckClaims.length; i += FACT_CHECK_BATCH_SIZE) {
+        const batch = factCheckClaims.slice(i, i + FACT_CHECK_BATCH_SIZE);
+        const batchNumber = Math.floor(i / FACT_CHECK_BATCH_SIZE) + 1;
+        const totalBatches = Math.ceil(factCheckClaims.length / FACT_CHECK_BATCH_SIZE);
+        
+        console.log(`  📦 Processing fact-check batch ${batchNumber}/${totalBatches} (${batch.length} claims)`);
+        
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout per batch
+          
+          const factCheckResponse = await fetch(`${API_BASE_URL}/api/factCheck`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              claims: batch
+            }),
+            signal: controller.signal
+          });
+
+          clearTimeout(timeoutId);
+
+          if (!factCheckResponse.ok) {
+            console.error(`  ❌ Batch ${batchNumber} failed with status: ${factCheckResponse.status}`);
+            // Add placeholder results for failed batch
+            batch.forEach(({ claim }) => {
+              factCheckResults.push({
+                claim,
+                Verdict: 'Unclear',
+                Reference: ['Failed to fact-check'],
+                Trust_Score: 50
+              });
+              totalTrustScore += 50;
+              trustScoreCount++;
+            });
+            continue;
+          }
+          
+          const fcJson = await factCheckResponse.json();
+          const batchResults = Array.isArray(fcJson?.results) ? fcJson.results : [];
+          const batchAvgScore = typeof fcJson?.averageTrustScore === 'number' ? fcJson.averageTrustScore : 50;
+          
+          console.log(`  ✅ Batch ${batchNumber} complete: ${batchResults.length} claims verified (avg score: ${batchAvgScore})`);
+          
+          factCheckResults.push(...batchResults);
+          totalTrustScore += batchAvgScore * batchResults.length;
+          trustScoreCount += batchResults.length;
+          
+        } catch (error) {
+          console.error(`  ❌ Error processing batch ${batchNumber}:`, error.message);
+          // Add placeholder results for error batch
+          batch.forEach(({ claim }) => {
+            factCheckResults.push({
+              claim,
+              Verdict: 'Unclear',
+              Reference: [error.name === 'AbortError' ? 'Timeout during fact-checking' : 'Error during fact-checking'],
+              Trust_Score: 50
+            });
+            totalTrustScore += 50;
+            trustScoreCount++;
+          });
+        }
+        
+        // Add a small delay between batches to avoid overwhelming the API
+        if (i + FACT_CHECK_BATCH_SIZE < factCheckClaims.length) {
+          await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
+        }
+      }
+      
+      // Calculate overall average trust score
+      averageTrustScore = trustScoreCount > 0 ? Math.round(totalTrustScore / trustScoreCount) : 50;
+      console.log(`✅ All fact-checking batches complete. Total: ${factCheckResults.length} claims, Avg score: ${averageTrustScore}`);
+    }
+    console.log("");
+    
+    // Merge results with fact-check data
+    const groupedByClaim = {};
+    batchResults.forEach((r) => {
+      const k = (r?.claim || '').toString().trim();
+      if (!k) return;
+      if (!groupedByClaim[k]) groupedByClaim[k] = [];
+      groupedByClaim[k].push({
+        url: String(r?.url || ''),
+        content: String(r?.content || ''),
+        title: r?.title || undefined,
+        excerpt: r?.excerpt || undefined,
+        error: r?.error || undefined,
+        relevantChunks: Array.isArray(r?.relevantChunks) ? r.relevantChunks : []
+      });
+    });
+
+    const claims = claimsData.claims.map((c, index) => {
+      const claimText = c.claim;
+      const group = groupedByClaim[claimText] || [];
+      const representative = group.length > 0 ? group[0] : { url: '', content: '' };
+      const fc = factCheckResults.find((r) => (r?.claim || '').toString().trim() === claimText.trim());
+      
+      const verdict = fc?.Verdict || fc?.verdict || 'Unclear';
+      const trustScore = typeof fc?.Trust_Score === 'number' ? fc.Trust_Score :
+                        typeof fc?.trustScore === 'number' ? fc.trustScore :
+                        typeof fc?.trust_score === 'number' ? fc.trust_score : 50;
+      
+      return {
+        text: claimText,
+        score: trustScore / 100, // Normalize to 0-1 for overall score calculation
+        raw_trust_score: trustScore, // Keep the raw 0-100 score for display
+        verification_status: verdict,
+        verified_by: [representative.url].filter(u => u),
+        types: [],
+        reasoning: Array.isArray(fc?.Reference) ? fc.Reference.join('; ') : fc?.reference || ''
+      };
+    });
+
+    // Calculate overall score from average trust score
+    const overall_score = averageTrustScore / 100; // Normalize to 0-1
+    
+    // Categorize content based on claims
+    const category = categorizeFromClaims(claims);
+    
+    // Generate verdict
+    let verdict, verdictEmoji;
+    if (overall_score >= 0.75) {
+      verdict = "HIGHLY TRUSTWORTHY";
+      verdictEmoji = "✅";
+    } else if (overall_score >= 0.60) {
+      verdict = "GENERALLY RELIABLE";
+      verdictEmoji = "👍";
+    } else if (overall_score >= 0.45) {
+      verdict = "MIXED CREDIBILITY";
+      verdictEmoji = "⚠️";
+    } else if (overall_score >= 0.30) {
+      verdict = "QUESTIONABLE";
+      verdictEmoji = "⚡";
+    } else {
+      verdict = "LIKELY UNRELIABLE";
+      verdictEmoji = "❌";
+    }
+    
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log(`${verdictEmoji} ANALYSIS COMPLETE: ${verdict}`);
+    console.log(`🎯 Overall Trust Score: ${(overall_score * 100).toFixed(1)}%`);
+    console.log(`📂 Category: ${category}`);
+    console.log(`📝 Claims Analyzed: ${claims.length}`);
+    console.log(`✅ Credible Claims: ${claims.filter(c => c.score >= 0.7).length}`);
+    console.log(`⚠️ Questionable Claims: ${claims.filter(c => c.score < 0.7 && c.score >= 0.4).length}`);
+    console.log(`❌ Suspicious Claims: ${claims.filter(c => c.score < 0.4).length}`);
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log("");
+    
+    // Prepare results
+    const results = {
+      url: data.url,
+      title: data.title,
+      domain: data.domain,
+      category: category,
+      overall_score: overall_score,
+      verdict: verdict,
+      claims: claims,
+      analyzed_at: new Date().toISOString(),
+      text_length: reclaimifyData.content?.length || 0
+    };
+    
+    // Save results to storage
+    console.log('💾 Saving results to storage with key:', `analysis_${data.url}`);
+    console.log('💾 Results object:', JSON.stringify(results, null, 2));
+    
+    await chrome.storage.local.set({ 
+      [`analysis_${data.url}`]: results 
+    });
+    
+    console.log('✅ Results saved to chrome.storage.local');
+    
+    // Verify it was saved
+    const verification = await chrome.storage.local.get([`analysis_${data.url}`]);
+    console.log('🔍 Verification - data in storage:', verification);
+    
+    // Also add to history
+    const historyResult = await chrome.storage.local.get(['extractions']);
+    const extractions = historyResult.extractions || [];
+    extractions.unshift(results);
+    if (extractions.length > 50) extractions.splice(50);
+    await chrome.storage.local.set({ extractions: extractions });
+    
+    // Send results back to content script (if tab exists)
+    if (tab && tab.id) {
+      try {
+        await chrome.tabs.sendMessage(tab.id, {
+          action: "showResults",
+          data: results
+        });
+      } catch (error) {
+        console.log("Could not send results to content script:", error.message);
+      }
+    }
+    
+  } catch (error) {
+    console.error("❌ ANALYSIS ERROR:", error);
+    console.error("Error name:", error.name);
+    console.error("Error message:", error.message);
+    console.error("Error stack:", error.stack);
+    
+    // Check if we have any partial results to save
+    let hasPartialResults = false;
+    let partialResults = null;
+    
+    try {
+      // If we got through some steps, try to save what we have
+      if (typeof extractData !== 'undefined' && extractData) {
+        hasPartialResults = true;
+        
+        const category = 'general';
+        const verdict = 'ANALYSIS INCOMPLETE';
+        const overall_score = 0.5;
+        
+        partialResults = {
+          url: data.url,
+          title: data.title,
+          domain: data.domain,
+          category: category,
+          overall_score: overall_score,
+          verdict: verdict,
+          claims: [],
+          error: error.message,
+          analyzed_at: new Date().toISOString(),
+          text_length: extractData.content?.length || 0,
+          partial: true
+        };
+      }
+    } catch (partialError) {
+      console.error("Could not create partial results:", partialError);
+    }
+    
+    // Save error state or partial results
+    const errorResult = partialResults || {
+      url: data.url,
+      title: data.title,
+      domain: data.domain,
+      category: 'error',
+      overall_score: 0.5,
+      verdict: 'ERROR',
+      claims: [],
+      error: error.message,
+      analyzed_at: new Date().toISOString()
+    };
+    
+    console.log('💾 Saving error/partial result:', errorResult);
+    
+    await chrome.storage.local.set({ 
+      [`analysis_${data.url}`]: errorResult 
+    });
+  }
+}
+
+// Simple category detection from claims text
+function categorizeFromClaims(claims) {
+  const allText = claims.map(c => c.text).join(' ').toLowerCase();
+  
+  if (/politic|election|government|minister/i.test(allText)) return 'politics';
+  if (/health|medical|disease|covid|vaccine/i.test(allText)) return 'health';
+  if (/science|research|study/i.test(allText)) return 'science';
+  if (/tech|software|app|ai/i.test(allText)) return 'technology';
+  if (/economy|market|stock|financial/i.test(allText)) return 'economy';
+  if (/climate|environment|carbon/i.test(allText)) return 'climate';
+  
+  return 'general';
+}
+
+
 // Background service worker for fact-checking
 
 console.log("🔍 Trust Score Analyzer: Background worker loaded");
