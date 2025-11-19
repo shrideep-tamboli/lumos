@@ -147,10 +147,22 @@ export default function Home() {
       // Add other properties if they exist in the processed sentences
     }
 
-    const processedSentences = reclaimifyData.processedSentences as ProcessedSentence[] | undefined;
+    const processedSentences = reclaimifyData.processedSentences as (ProcessedSentence & {
+      implicitClaims?: Array<string | { claim: string }>;
+    })[] | undefined;
     const verifiableFromProcessed = Array.isArray(processedSentences)
       ? processedSentences
-          .map((p) => (p?.finalClaim ?? '').toString().trim())
+          .flatMap((p) => {
+            const implicit = Array.isArray(p?.implicitClaims)
+              ? p!.implicitClaims!
+                  .map((c) => (typeof c === 'string' ? c : c.claim))
+                  .map((s) => (s ?? '').toString().trim())
+                  .filter((s) => s.length > 0)
+              : [];
+            if (implicit.length > 0) return implicit;
+            const fc = (p?.finalClaim ?? '').toString().trim();
+            return fc ? [fc] : [];
+          })
           .filter((s) => s.length > 0)
       : [];
 

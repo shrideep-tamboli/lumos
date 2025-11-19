@@ -61,6 +61,8 @@ export interface CategorizedSentence {
   sentence: string;
   category: 'Verifiable' | 'Partially Verifiable' | 'Not Verifiable';
   reasoning: string;
+  implicitClaims?: string[];
+  implicitClaimsReasoning?: string;
 }
 
 export interface RewrittenPartial {

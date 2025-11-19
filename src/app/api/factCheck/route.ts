@@ -219,11 +219,11 @@ Strictly output a JSON array where each element has these keys:
 - Verdict: One of ["Support","Partially Support","Unclear","Contradict","Refute"]
 - Reason: Short textual justification for the verdict referencing the evidence
 - Reference: Array of 1-3 exact quotes from the evidence (include source numbers like [Source 1])
-- Trust_Score: Number from 0-100 based on evidence strength
+- Trust_Score: Number from -100 to 100 based on evidence strength
   - 100: Strong support with multiple reliable sources
-  - 65-99: Partial support or single source
-  - 50: Unclear or conflicting evidence
-  - 0-49: Evidence contradicts the claim
+  - 65: Partial support or single source
+  - 0: Unclear or conflicting evidence
+  - -100: Evidence contradicts the claim
 
 Format example:
 [
@@ -253,9 +253,9 @@ Format example:
         const n = normalize(v);
         if (n === 'support' || n === 'supports') return 100;
         if (n === 'partially support' || n === 'partially_supports' || n === 'partially-supports') return 65;
-        if (n === 'unclear' || n === 'neutral') return 50;
-        if (n === 'contradict' || n === 'refute' || n === 'contradicts' || n === 'refutes') return 0;
-        return 50;
+        if (n === 'unclear' || n === 'neutral') return 0;
+        if (n === 'contradict' || n === 'refute' || n === 'contradicts' || n === 'refutes') return -100;
+        return 0;
       };
 
       return (parsed || []).map(item => {
@@ -274,7 +274,7 @@ Format example:
             : item.Reference 
               ? [String(item.Reference)] 
               : [],
-          Trust_Score: typeof item.Trust_Score === 'number' 
+          Trust_Score: typeof item.Trust_Score === 'number' && !isValidVerdict
             ? Math.max(0, Math.min(100, item.Trust_Score))
             : scoreFor(verdict)
         };
@@ -359,8 +359,12 @@ Format example:
       }
     }
 
-    // Calculate average trust score
-    const validScores = batchResults.filter(r => typeof r.Trust_Score === 'number' && !isNaN(r.Trust_Score));
+    // Calculate average trust score (excluding Unclear verdicts)
+    const validScores = batchResults.filter(r => 
+      typeof r.Trust_Score === 'number' && 
+      !isNaN(r.Trust_Score) && 
+      r.Verdict !== 'Unclear'
+    );
     const averageTrustScore = validScores.length > 0 
       ? Math.round(validScores.reduce((sum, r) => sum + r.Trust_Score, 0) / validScores.length)
       : 0;

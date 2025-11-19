@@ -74,7 +74,7 @@ return (
                                  typeof result.Trust_Score === 'number' ? result.Trust_Score : undefined;
                   if (typeof trust === 'number') {
                     return (
-                      <div className="mt-1 text-lg font-bold">
+                      <div className="mt-1 text-lg font-bold text-black">
                         {trust}
                       </div>
                     );

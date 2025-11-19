@@ -35,10 +35,15 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
     }));
   };
 
+  type ImplicitClaim = string | { claim: string; reasoning?: string };
+
   type EnrichedSentence = CategorizedSentence & {
     disambiguation?: DisambiguationResult | null;
     rewrittenVerifiablePart?: string;
     rewriteReasoning?: string;
+    implicitClaims?: ImplicitClaim[];
+    implicitClaimsReasoning?: string;
+    finalClaim?: string;
   };
 
   // Define the processed sentence type
@@ -52,6 +57,9 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
     disambiguatedSentence?: string;
     rewrittenSentence?: string;
     rewriteReasoning?: string;
+    implicitClaims?: Array<string | { claim: string; reasoning?: string }>;
+    implicitClaimsReasoning?: string;
+    finalClaim?: string;
   }
 
   // Build a unified enriched list from new or old response shapes
@@ -69,7 +77,7 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
         const rewriteReasoning = (p?.rewriteReasoning ?? undefined) as (string | undefined);
         return {
           sentence: originalSentence,
-          category: category as 'Support' | 'Partially Support' | 'Unclear' | 'Contradict' | 'Refute' | 'Not Verifiable',
+          category: category as 'Verifiable' | 'Partially Verifiable' | 'Not Verifiable',
           reasoning,
           disambiguation: {
             sentence: originalSentence,
@@ -80,7 +88,10 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
             disambiguatedSentence: disambiguatedSentence
           },
           rewrittenVerifiablePart: rewrittenSentence,
-          rewriteReasoning: rewriteReasoning
+          rewriteReasoning: rewriteReasoning,
+          implicitClaims: p?.implicitClaims,
+          implicitClaimsReasoning: p?.implicitClaimsReasoning,
+          finalClaim: p?.finalClaim
         } as EnrichedSentence;
       })
     : (Array.isArray(data.categorizedSentences)
@@ -100,7 +111,9 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
                 disambiguatedSentence: disambiguated?.sentence || sentence.sentence
               } : null,
               rewrittenVerifiablePart: rewritten?.rewrittenSentence,
-              rewriteReasoning: rewritten?.reasoning
+              rewriteReasoning: rewritten?.reasoning,
+              implicitClaims: (sentence as any)?.implicitClaims,
+              implicitClaimsReasoning: (sentence as any)?.implicitClaimsReasoning
             } as EnrichedSentence;
           })
         : []);
@@ -176,7 +189,7 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
                           {getCategoryIcon(category)}
                           <span className="text-sm font-medium text-gray-700">{category}</span>
                         </div>
-                        <span className="text-sm font-semibold">{count}</span>
+                        <span className="text-sm text-gray-800 font-semibold">{count}</span>
                       </div>
                       <div className="w-full bg-gray-200 rounded-full h-2 mt-2">
                         <div 
@@ -231,6 +244,30 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
                         </div>
                       </div>
 
+
+                      {/* Verifiable Claim(s) derived from implicitClaims or finalClaim */}
+                      <div className="space-y-2">
+                        <div className="text-sm font-medium text-gray-700">Verifiable Claim(s)</div>
+                        {(() => {
+                          const hasImplicit = Array.isArray(sentence.implicitClaims) && sentence.implicitClaims.length > 0;
+                          const claims: string[] = hasImplicit
+                            ? sentence.implicitClaims!.map((c: ImplicitClaim) => (typeof c === 'string' ? c : c.claim)).filter(Boolean)
+                            : (sentence.finalClaim ? [sentence.finalClaim] : []);
+                          if (claims.length === 0) return null;
+                          return (
+                            <>
+                              <ul className="list-disc list-inside space-y-1">
+                                {claims.map((text: string, i: number) => (
+                                  <li key={i} className="text-sm text-gray-800">{text}</li>
+                                ))}
+                              </ul>
+                              {hasImplicit && sentence.implicitClaimsReasoning && (
+                                <div className="text-xs text-gray-600">{sentence.implicitClaimsReasoning}</div>
+                              )}
+                            </>
+                          );
+                        })()}
+                      </div>
 
                       {/* Disambiguation and Verifiable Parts */}
                       <div className="space-y-3">
