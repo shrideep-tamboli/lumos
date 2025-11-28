@@ -116,15 +116,43 @@ export default function Home() {
     const reclaimifyData: ReclaimifyApiResponse = await reclaimifyResponse.json();
     setReclaimifyData(reclaimifyData);
     setResult({ url: reclaimifyData.url || url.trim(), content: reclaimifyData.content || '' });
+    setActiveTab('summary'); // Switch to Analysis Summary tab after getting reclaimify data
 
-    // 2. Extract verifiable claims
-    const categorized = Array.isArray(reclaimifyData.categorizedSentences) 
-      ? reclaimifyData.categorizedSentences 
+    // 2. Build verifiable claims from new API shape first, fallback to old
+    const verifiableFromArray = Array.isArray(reclaimifyData.verifiableClaims)
+      ? reclaimifyData.verifiableClaims.filter((s) => typeof s === 'string' && s.trim().length > 0)
       : [];
-    
-    const verifiableList = categorized
+
+    interface ProcessedSentence {
+      finalClaim?: string;
+      // Add other properties if they exist in the processed sentences
+    }
+
+    const processedSentences = reclaimifyData.processedSentences as ProcessedSentence[] | undefined;
+    const verifiableFromProcessed = Array.isArray(processedSentences)
+      ? processedSentences
+          .map((p) => (p?.finalClaim ?? '').toString().trim())
+          .filter((s) => s.length > 0)
+      : [];
+
+    const categorized = Array.isArray(reclaimifyData.categorizedSentences)
+      ? reclaimifyData.categorizedSentences
+      : [];
+    const verifiableFromCategorized = categorized
       .filter((item) => item.category === 'Verifiable')
       .map((item) => item.sentence);
+
+    const verifiableList: string[] = verifiableFromArray.length > 0
+      ? verifiableFromArray
+      : (verifiableFromProcessed.length > 0
+          ? verifiableFromProcessed
+          : verifiableFromCategorized);
+
+    if (!verifiableList.length) {
+      setLoadingState(prev => ({ ...prev, step1: false }));
+      setError('No verifiable claims found from the article.');
+      return;
+    }
 
     const searchDate = new Date().toISOString().split('T')[0];
     const claimsData = {
@@ -609,7 +637,7 @@ export default function Home() {
                   }`}
                   onClick={() => setActiveTab('analysis')}
                 >
-                  Claimy Analysis
+                  Claimify Analysis
                 </button>
                 <button
                   className={`py-2 px-4 font-medium text-sm ${

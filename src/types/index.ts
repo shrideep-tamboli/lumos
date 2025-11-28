@@ -74,9 +74,24 @@ export interface ReclaimifyApiResponse {
   content: string;
   sentences: string[];
   timestamp: string;
+  // Old shape (backward compatibility)
   categorizedSentences?: CategorizedSentence[];
   rewrittenPartials?: RewrittenPartial[];
   disambiguatedSentences?: DisambiguationResult[];
+  // New shape
+  processedSentences?: Array<{
+    originalSentence: string;
+    category: 'Verifiable' | 'Partially Verifiable' | 'Not Verifiable';
+    categoryReasoning: string;
+    rewrittenSentence?: string;
+    rewriteReasoning?: string;
+    isAmbiguous: boolean;
+    ambiguityType?: 'referential' | 'structural';
+    ambiguityReasoning?: string | null;
+    disambiguatedSentence?: string | null;
+    finalClaim?: string | null;
+  }>;
+  verifiableClaims?: string[];
 }
 
 export interface FactCheckResult {

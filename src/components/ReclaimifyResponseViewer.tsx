@@ -41,30 +41,69 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
     rewriteReasoning?: string;
   };
 
-  const categorizedSentences: EnrichedSentence[] = Array.isArray(data.categorizedSentences) 
-    ? data.categorizedSentences.map((sentence, index: number) => {
-        // Find matching disambiguated sentence
-        const disambiguated = Array.isArray(data.disambiguatedSentences) 
-          ? data.disambiguatedSentences[index] 
-          : null;
-          
-        // Find matching rewritten partial
-        const rewritten = Array.isArray(data.rewrittenPartials) 
-          ? data.rewrittenPartials.find((r: RewrittenPartial) => r.originalSentence === sentence.sentence)
-          : null;
-          
+  // Define the processed sentence type
+  interface ProcessedSentence {
+    originalSentence?: string;
+    category?: string;
+    categoryReasoning?: string;
+    isAmbiguous?: boolean;
+    ambiguityType?: 'referential' | 'structural';
+    ambiguityReasoning?: string;
+    disambiguatedSentence?: string;
+    rewrittenSentence?: string;
+    rewriteReasoning?: string;
+  }
+
+  // Build a unified enriched list from new or old response shapes
+  const processedSentences = (data as { processedSentences?: ProcessedSentence[] }).processedSentences || [];
+  const enriched: EnrichedSentence[] = Array.isArray(processedSentences) && processedSentences.length > 0
+    ? processedSentences.map((p: ProcessedSentence) => {
+        const originalSentence: string = (p?.originalSentence ?? '').toString();
+        const category: string = (p?.category ?? 'Not Verifiable').toString();
+        const reasoning: string = (p?.categoryReasoning ?? '').toString();
+        const isAmbiguous: boolean = !!p?.isAmbiguous;
+        const ambiguityType = p?.ambiguityType as ('referential' | 'structural' | undefined);
+        const ambiguityReasoning = (p?.ambiguityReasoning ?? undefined) as (string | undefined);
+        const disambiguatedSentence = (p?.disambiguatedSentence ?? undefined) as (string | undefined);
+        const rewrittenSentence = (p?.rewrittenSentence ?? undefined) as (string | undefined);
+        const rewriteReasoning = (p?.rewriteReasoning ?? undefined) as (string | undefined);
         return {
-          ...sentence,
-          disambiguation: disambiguated ? {
-            ...disambiguated,
-            // Use the disambiguated sentence if available, otherwise use the original
-            disambiguatedSentence: disambiguated?.sentence || sentence.sentence
-          } : null,
-          rewrittenVerifiablePart: rewritten?.rewrittenSentence,
-          rewriteReasoning: rewritten?.reasoning
-        };
+          sentence: originalSentence,
+          category: category as 'Support' | 'Partially Support' | 'Unclear' | 'Contradict' | 'Refute' | 'Not Verifiable',
+          reasoning,
+          disambiguation: {
+            sentence: originalSentence,
+            isAmbiguous,
+            reasoning: ambiguityReasoning || '',
+            ambiguityType,
+            ambiguityReasoning: ambiguityReasoning,
+            disambiguatedSentence: disambiguatedSentence
+          },
+          rewrittenVerifiablePart: rewrittenSentence,
+          rewriteReasoning: rewriteReasoning
+        } as EnrichedSentence;
       })
-    : [];
+    : (Array.isArray(data.categorizedSentences)
+        ? data.categorizedSentences.map((sentence, index: number) => {
+            // Find matching disambiguated sentence
+            const disambiguated = Array.isArray(data.disambiguatedSentences)
+              ? data.disambiguatedSentences[index]
+              : null;
+            // Find matching rewritten partial
+            const rewritten = Array.isArray(data.rewrittenPartials)
+              ? data.rewrittenPartials.find((r: RewrittenPartial) => r.originalSentence === sentence.sentence)
+              : null;
+            return {
+              ...sentence,
+              disambiguation: disambiguated ? {
+                ...disambiguated,
+                disambiguatedSentence: disambiguated?.sentence || sentence.sentence
+              } : null,
+              rewrittenVerifiablePart: rewritten?.rewrittenSentence,
+              rewriteReasoning: rewritten?.reasoning
+            } as EnrichedSentence;
+          })
+        : []);
 
   return (
     <div className={`bg-gray-50 border border-gray-300 rounded p-4 ${className}`}>
@@ -115,19 +154,19 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
             <div className="p-3 bg-white border border-gray-200 rounded">
               <div className="text-gray-700 font-medium mb-1">Verifiable Candidates</div>
               <div className="font-semibold text-black">
-                {categorizedSentences.filter((s) => s.category === 'Verifiable' || s.category === 'Partially Verifiable').length}
+                {enriched.filter((s) => s.category === 'Verifiable' || s.category === 'Partially Verifiable').length}
               </div>
             </div>
           </div>
 
           {/* Categories Breakdown */}
-          {categorizedSentences.length > 0 && (
+          {enriched.length > 0 && (
             <div className="mt-4">
               <h4 className="font-medium text-gray-800 mb-2">Categories Breakdown</h4>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                 {['Verifiable', 'Partially Verifiable', 'Not Verifiable'].map((category) => {
-                  const count = categorizedSentences.filter((s) => s.category === category).length;
-                  const total = categorizedSentences.length;
+                  const count = enriched.filter((s) => s.category === category).length;
+                  const total = enriched.length;
                   const percentage = total > 0 ? Math.round((count / total) * 100) : 0;
                   
                   return (
@@ -161,9 +200,9 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
       {/* Detailed Analysis View */}
       {activeTab === 'details' && (
         <div className="space-y-4">
-          {categorizedSentences.length > 0 ? (
+          {enriched.length > 0 ? (
             <div className="space-y-3">
-              {categorizedSentences.map((sentence, index: number) => (
+              {enriched.map((sentence, index: number) => (
                 <div key={index} className="border border-gray-200 rounded-lg overflow-hidden">
                   <div 
                     className="p-3 bg-gray-50 border-b border-gray-200 flex justify-between items-center cursor-pointer hover:bg-gray-100"
