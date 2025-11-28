@@ -112,8 +112,8 @@ export function ReclaimifyResponseViewer({ data, className = '' }: ReclaimifyRes
               } : null,
               rewrittenVerifiablePart: rewritten?.rewrittenSentence,
               rewriteReasoning: rewritten?.reasoning,
-              implicitClaims: (sentence as any)?.implicitClaims,
-              implicitClaimsReasoning: (sentence as any)?.implicitClaimsReasoning
+implicitClaims: sentence.implicitClaims,
+              implicitClaimsReasoning: sentence.implicitClaimsReasoning
             } as EnrichedSentence;
           })
         : []);

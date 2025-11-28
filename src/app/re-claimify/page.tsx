@@ -242,28 +242,6 @@ function ReclaimifyContent() {
     }
   };
 
-  const renderReasoning = (title: string, content?: string) => {
-    if (!content) return null;
-    return (
-      <div className="mt-2 p-3 bg-gray-50 rounded-md">
-        <h4 className="font-medium text-sm text-gray-700 mb-1">{title}:</h4>
-        <p className="text-sm text-gray-600 whitespace-pre-line">{content}</p>
-      </div>
-    );
-  };
-
-  const renderImplicitClaim = (claim: any, index: number) => (
-    <div key={index} className="ml-4 pl-4 border-l-2 border-gray-200 mt-2">
-      <div className="font-medium text-sm">Implicit Claim: <span className="text-gray-700">{claim.claim}</span></div>
-      {claim.reasoning && (
-        <div className="text-xs text-gray-600 mt-1">Reasoning: {claim.reasoning}</div>
-      )}
-      {claim.finalClaim && claim.claim !== claim.finalClaim && (
-        <div className="text-xs text-green-600 mt-1">Processed as: {claim.finalClaim}</div>
-      )}
-    </div>
-  );
-
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-100">
