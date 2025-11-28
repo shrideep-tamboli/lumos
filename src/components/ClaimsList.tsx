@@ -6,24 +6,11 @@ export type { SearchResult, ClaimsResponse, ClaimsListProps, RelevantChunk };
 export default function ClaimsList({ claims, searchResults = [] }: ClaimsListProps) {
   if (!claims?.claims?.length) return null;
 
-  const getPreviewText = (content: string, maxLength = 150) => {
-    if (!content) return '';
-    return content.length > maxLength 
-      ? `${content.substring(0, maxLength)}...` 
-      : content;
-  };
-
   // In ClaimsList.tsx, replace the return statement with:
 return (
   <div className="mt-8 p-6 border-2 border-black bg-white">
-    <div className="flex justify-between items-center mb-4">
-      <h3 className="font-bold text-lg text-black">Extracted Claims ({claims.claims.length})</h3>
-      <span className="text-sm text-gray-500">
-        {new Date(claims.search_date).toLocaleDateString()}
-      </span>
-    </div>
     
-    <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2 -mr-2">
+    <div className="space-y-4">
       {claims.claims.map((claim, index) => {
         const result = searchResults?.[index];
         if (!result) return null;
@@ -32,7 +19,7 @@ return (
           <div key={index} className="p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
             <div className="flex justify-between items-start">
               <div className="flex-1">
-                <p className="text-gray-900 font-medium">{claim.claim}</p>
+                <p className="text-gray-900 font-medium">Claim: {claim.claim}</p>
                 {result.reference && (
                   <p className="mt-1 text-sm text-gray-600">
                     <span className="font-medium">Reference:</span> {result.reference}
