@@ -1,10 +1,15 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { v4 as uuidv4 } from 'uuid';
 
 import ClaimsList from '@/components/ClaimsList';
 import InfoDialog from '@/components/InfoDialog';
 import { ReclaimifyResponseViewer } from '@/components/ReclaimifyResponseViewer';
+import { RequestLog } from '@/components/RequestLogger';
+import { RequestLogger } from '@/components/RequestLogger';
+import { RequestProgressDialog } from '@/components/RequestProgressDialog';
+import { ThreeColumnLayout } from '@/components/ThreeColumnLayout';
 import { SearchResult, ClaimsResponse, ReclaimifyApiResponse, FactCheckResult } from '@/types';
 
 interface RelevantChunk {
@@ -96,14 +101,14 @@ export default function Home() {
   const [analysisState, setAnalysisState] = useState<AnalysisState>({
     totalClaims: 0,
     analyzedCount: 0,
+    avgTrustScore: 0,
     verdicts: {
       support: 0,
       partially: 0,
       unclear: 0,
       contradict: 0,
       refute: 0
-    },
-    avgTrustScore: 0
+    }
   });
   const [loadingState, setLoadingState] = useState<LoadingState>({
     step1: false,
@@ -114,12 +119,125 @@ export default function Home() {
   });
 
   const [showClaimsPanel, setShowClaimsPanel] = useState(false);
+  const [requestLogs, setRequestLogs] = useState<RequestLog[]>([]);
+  const [activeRequests, setActiveRequests] = useState<Array<{
+    id: string;
+    method: string;
+    url: string;
+    status: 'pending' | 'success' | 'error';
+    progress?: number;
+  }>>([]);
+  
+  const progressIntervals = useRef<Record<string, NodeJS.Timeout>>({});
+  const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
+
+  const logRequest = useCallback((log: Omit<RequestLog, 'id' | 'timestamp'>) => {
+    const id = uuidv4();
+    const timestamp = new Date();
+    
+    // Add to active requests
+    setActiveRequests(prev => [
+      ...prev,
+      {
+        id,
+        method: log.method,
+        url: log.url,
+        status: log.status,
+        progress: 0
+      }
+    ]);
+    
+    // Start progress animation
+    progressIntervals.current[id] = setInterval(() => {
+      setActiveRequests(prev => 
+        prev.map(req => 
+          req.id === id && req.status === 'pending' && req.progress !== undefined && req.progress < 90
+            ? { ...req, progress: req.progress + 10 }
+            : req
+        )
+      );
+    }, 500);
+    
+    // Add new log to the end of the array (chronological order)
+    setRequestLogs(prevLogs => [
+      ...prevLogs,
+      {
+        id,
+        timestamp,
+        ...log
+      }
+    ]);
+    
+    setSelectedRequestId(id);
+    return id;
+  }, []);
+
+  const updateRequestLog = useCallback((id: string, updates: Partial<Omit<RequestLog, 'id' | 'timestamp'>>) => {
+    setRequestLogs(prevLogs =>
+      prevLogs.map(log =>
+        log.id === id ? { ...log, ...updates } : log
+      )
+    );
+    
+    // Update active requests
+    if (updates.status && updates.status !== 'pending') {
+      // Clear the progress interval for this request
+      if (progressIntervals.current[id]) {
+        clearInterval(progressIntervals.current[id]);
+        delete progressIntervals.current[id];
+      }
+      
+      // Update the request status
+      setActiveRequests(prev => 
+        prev.map(req => 
+          req.id === id 
+            ? { 
+                ...req, 
+                status: updates.status as 'success' | 'error',
+                progress: 100 
+              }
+            : req
+        )
+      );
+      
+      // Remove from active requests after a delay
+      setTimeout(() => {
+        setActiveRequests(prev => prev.filter(req => req.id !== id));
+      }, 1000);
+    }
+  }, []);
+
+  const clearLogs = useCallback(() => {
+    setRequestLogs([]);
+    // Clear all progress intervals
+    Object.values(progressIntervals.current).forEach(interval => clearInterval(interval));
+    progressIntervals.current = {};
+    setActiveRequests([]);
+  }, []);
+
+  // Clean up intervals on unmount
+  useEffect(() => {
+    return () => {
+      Object.values(progressIntervals.current).forEach(interval => clearInterval(interval));
+    };
+  }, []);
+
+  const selectedRequest = selectedRequestId
+    ? requestLogs.find(l => l.id === selectedRequestId) || null
+    : (requestLogs[requestLogs.length - 1] || null);
+  const selectedActive = selectedRequest
+    ? activeRequests.find(a => a.id === selectedRequest.id)
+    : undefined;
 
   const handleAnalyze = async () => {
     if (!url.trim()) {
       setError('Please enter a URL');
       return;
     }
+    
+    // Clear previous logs when starting a new analysis
+    setRequestLogs([]);
 
     setIsLoading(true);
     setError(null);
@@ -138,33 +256,85 @@ export default function Home() {
     try {
       // 1. Extract text from URL (handles both regular URLs and YouTube URLs)
       setLoadingState(prev => ({ ...prev, step1: true }));
-      const extractResponse = await fetch(`/api/extract?url=${encodeURIComponent(url.trim())}`);
       
-      if (!extractResponse.ok) {
-        const errorData = await extractResponse.json().catch(() => ({}));
-        throw new Error(errorData.error || 'Failed to extract content from URL');
-      }
-      
-      const extractData = await extractResponse.json();
-      
-      // 2. Send extracted content to reclaimify for processing (works for both regular URLs and YouTube URLs)
-      const reclaimifyResponse = await fetch('/api/reclaimify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: extractData.url || url.trim(),
-          content: extractData.content,
-          title: extractData.title,
-          excerpt: extractData.excerpt
-        })
+      const extractUrl = `/api/extract?url=${encodeURIComponent(url.trim())}`;
+      const extractLogId = logRequest({
+        method: 'GET',
+        url: extractUrl,
+        status: 'pending',
+        requestBody: { url: url.trim() }
       });
       
-      if (!reclaimifyResponse.ok) {
-        const errorData = await reclaimifyResponse.json().catch(() => ({}));
-        throw new Error(errorData.error || 'Failed to process content');
+      let extractResponse: Response;
+      let extractData: any;
+      
+      try {
+        extractResponse = await fetch(extractUrl);
+        extractData = await extractResponse.json();
+        
+        updateRequestLog(extractLogId, {
+          status: extractResponse.ok ? 'success' : 'error',
+          response: extractData,
+          error: extractResponse.ok ? undefined : extractData.error || 'Failed to extract content'
+        });
+        
+        if (!extractResponse.ok) {
+          throw new Error(extractData.error || 'Failed to extract content from URL');
+        }
+      } catch (err) {
+        updateRequestLog(extractLogId, {
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Unknown error during extraction'
+        });
+        throw err;
       }
       
-      const reclaimifyData: ReclaimifyApiResponse = await reclaimifyResponse.json();
+      // 2. Send extracted content to reclaimify for processing (works for both regular URLs and YouTube URLs)
+      const reclaimifyPayload = {
+        url: extractData.url || url.trim(),
+        content: extractData.content,
+        title: extractData.title,
+        excerpt: extractData.excerpt
+      };
+      
+      const reclaimifyLogId = logRequest({
+        method: 'POST',
+        url: '/api/reclaimify',
+        status: 'pending',
+        requestBody: {
+          ...reclaimifyPayload,
+          content: reclaimifyPayload.content ? '[content truncated]' : null
+        }
+      });
+      
+      let reclaimifyResponse: Response;
+      let reclaimifyData: ReclaimifyApiResponse;
+      
+      try {
+        reclaimifyResponse = await fetch('/api/reclaimify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reclaimifyPayload)
+        });
+        
+        reclaimifyData = await reclaimifyResponse.json();
+        
+        updateRequestLog(reclaimifyLogId, {
+          status: reclaimifyResponse.ok ? 'success' : 'error',
+          response: reclaimifyData,
+          error: reclaimifyResponse.ok ? undefined : (reclaimifyData as any).error || 'Failed to process content'
+        });
+        
+        if (!reclaimifyResponse.ok) {
+          throw new Error((reclaimifyData as any).error || 'Failed to process content');
+        }
+      } catch (err) {
+        updateRequestLog(reclaimifyLogId, {
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Unknown error during reclaimify processing'
+        });
+        throw err;
+      }
       setReclaimifyData(reclaimifyData);
       setResult({ url: reclaimifyData.url || url.trim(), content: reclaimifyData.content || '' });
       setActiveTab('summary'); // Switch to Analysis Summary tab after getting reclaimify data
@@ -243,21 +413,48 @@ export default function Home() {
 
       // 4. Call websearch
       setLoadingState(prev => ({ ...prev, step1: false, step2: true }));
-      const webSearchResponse = await fetch('/api/websearch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          claims: claimsData.claims,
-          search_date: searchDate,
-          originalUrl: url.trim()
-        })
-      });
-
-      if (!webSearchResponse.ok) {
-        throw new Error('Failed to perform web search');
-      }
       
-      const webSearchData = await webSearchResponse.json() as WebSearchResponse;
+      const webSearchPayload = { 
+        claims: claimsData.claims,
+        search_date: searchDate,
+        originalUrl: url.trim()
+      };
+      
+      const webSearchLogId = logRequest({
+        method: 'POST',
+        url: '/api/websearch',
+        status: 'pending',
+        requestBody: webSearchPayload
+      });
+      
+      let webSearchResponse: Response;
+      let webSearchData: WebSearchResponse;
+      
+      try {
+        webSearchResponse = await fetch('/api/websearch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(webSearchPayload)
+        });
+        
+        webSearchData = await webSearchResponse.json() as WebSearchResponse;
+        
+        updateRequestLog(webSearchLogId, {
+          status: webSearchResponse.ok ? 'success' : 'error',
+          response: webSearchData,
+          error: webSearchResponse.ok ? undefined : 'Failed to perform web search'
+        });
+        
+        if (!webSearchResponse.ok) {
+          throw new Error('Failed to perform web search');
+        }
+      } catch (err) {
+        updateRequestLog(webSearchLogId, {
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Unknown error during web search'
+        });
+        throw err;
+      }
       
       if (!isWebSearchResponse(webSearchData)) {
         throw new Error('Invalid web search response format');
@@ -283,25 +480,65 @@ export default function Home() {
       setLoadingState(prev => ({ ...prev, step2: false, step3: true }));
       
       if (flattenedUrls.length === 0) {
-        throw new Error('No valid URLs found for analysis');
+        const errorMsg = 'No valid URLs found for analysis';
+        logRequest({
+          method: 'POST',
+          url: '/api/analyze/batch',
+          status: 'error',
+          requestBody: { urls: [], claims: claimsOnePerUrl },
+          error: errorMsg
+        });
+        throw new Error(errorMsg);
       }
       
-      const batchResponse = await fetch('/api/analyze/batch', {
+      const batchPayload = { 
+        urls: flattenedUrls,
+        claims: claimsOnePerUrl
+      };
+      
+      const batchLogId = logRequest({
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          urls: flattenedUrls,
-          claims: claimsOnePerUrl
-        })
+        url: '/api/analyze/batch',
+        status: 'pending',
+        requestBody: {
+          ...batchPayload,
+          urls: batchPayload.urls.map(url => ({
+            url: url,
+            content: '[content truncated]'
+          }))
+        }
       });
-
-      if (!batchResponse.ok) {
-        const errorData = await batchResponse.text();
-        console.error('Batch analysis failed:', errorData);
-        throw new Error('Failed to analyze content');
+      
+      let batchResponse: Response;
+      let batchData: { results?: unknown[] } = {};
+      
+      try {
+        batchResponse = await fetch('/api/analyze/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(batchPayload)
+        });
+        
+        batchData = await batchResponse.json();
+        
+        updateRequestLog(batchLogId, {
+          status: batchResponse.ok ? 'success' : 'error',
+          response: batchData,
+          error: batchResponse.ok ? undefined : 'Batch analysis failed'
+        });
+        
+        if (!batchResponse.ok) {
+          console.error('Batch analysis failed:', batchData);
+          throw new Error('Failed to analyze content');
+        }
+      } catch (err) {
+        updateRequestLog(batchLogId, {
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Unknown error during batch analysis'
+        });
+        throw err;
       }
 
-      const batchData = await batchResponse.json();
       const batchResults: BatchAnalysisResult[] = Array.isArray(batchData?.results) 
         ? batchData.results.filter(isBatchAnalysisResult) 
         : [];
@@ -336,36 +573,65 @@ export default function Home() {
         const requests: Array<Promise<any>> = [];
         
         // Create a promise for each claim's fact check
-        const factCheckPromises = factCheckClaims.map(claimData => 
-          fetch('/api/factCheck', {
+        const factCheckPromises = factCheckClaims.map(claimData => {
+          const fcLogId = logRequest({
+            method: 'POST',
+            url: '/api/factCheck',
+            status: 'pending',
+            requestBody: { claims: [claimData] }
+          });
+
+          return fetch('/api/factCheck', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ claims: [claimData] }) // Send one claim at a time
           })
           .then(async (r) => {
+            const json = await r.json().catch(() => null);
+            updateRequestLog(fcLogId, {
+              status: r.ok ? 'success' : 'error',
+              response: json || undefined,
+              error: r.ok ? undefined : 'Failed to perform fact checking'
+            });
             if (!r.ok) {
               console.error('Failed to perform fact checking for claim:', claimData.claim);
               return null;
             }
-            return r.json();
+            return json;
           })
           .catch(error => {
+            updateRequestLog(fcLogId, { status: 'error', error: String(error) });
             console.error('Error in fact check request:', error);
             return null;
-          })
-        );
+          });
+        });
 
         // Bias request (only if we have items)
         if (notVerifiableItems.length > 0) {
+          const biasLogId = logRequest({
+            method: 'POST',
+            url: '/api/bias',
+            status: 'pending',
+            requestBody: { items: notVerifiableItems.length }
+          });
           requests.push(
             fetch('/api/bias', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ items: notVerifiableItems })
             }).then(async (r) => {
+              const json = await r.json().catch(() => null);
+              updateRequestLog(biasLogId, {
+                status: r.ok ? 'success' : 'error',
+                response: json || undefined,
+                error: r.ok ? undefined : 'Failed to classify opinions'
+              });
               if (!r.ok) throw new Error('Failed to classify opinions');
-              return r.json();
-            }).catch(() => null)
+              return json;
+            }).catch((e) => {
+              updateRequestLog(biasLogId, { status: 'error', error: String(e) });
+              return null;
+            })
           );
         }
 
@@ -689,355 +955,282 @@ export default function Home() {
     }
   };
 
-  return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gray-200 p-4 relative">
-      <InfoDialog />
-      
-      {/* Main Content Container with Responsive Layout */}
-      <div className={`w-full transition-all duration-500 ease-in-out ${
-        showClaimsPanel 
-          ? 'max-w-7xl flex gap-6' 
-          : 'max-w-2xl'
-      } px-4 sm:px-6`}>
-        
-        {/* Left Panel - Analysis Summary (shifts left when claims panel opens) */}
-        <div className={`transition-all duration-500 ease-in-out ${
-          showClaimsPanel 
-            ? 'w-1/2 flex-shrink-0' 
-            : 'w-full'
-        }`}>
-        <div className="text-center mb-8">
-          <h1 className="text-5xl font-black text-black mb-2 tracking-tight">
-            LUMOUS
-          </h1>
-          <p className="text-gray-800 max-w-md mx-auto text-lg mb-6">
-            Illuminate the truth behind every headline
-          </p>
-          
-          {/* Mode Toggle 
-          <div className="flex items-center justify-center mb-6">
-            <div className="flex items-center border-2 border-black rounded-lg overflow-hidden">
-              <button
-                onClick={() => setMode('analyze')}
-                className={`px-6 py-2 font-medium ${
-                  mode === 'analyze' 
-                    ? 'bg-black text-white' 
-                    : 'bg-white text-black hover:bg-gray-100'
-                } transition-colors duration-200`}
-              >
-                Analyze
-              </button>
-              <div className="h-6 w-0.5 bg-black"></div>
-              <button
-                onClick={() => setMode('claimify')}
-                className={`px-6 py-2 font-medium ${
-                  mode === 'claimify' 
-                    ? 'bg-black text-white' 
-                    : 'bg-white text-black hover:bg-gray-100'
-                } transition-colors duration-200`}
-              >
-                Claimify
-              </button>
-              <div className="h-6 w-0.5 bg-black"></div>
-              <button
-                onClick={() => setMode('reclaimify')}
-                className={`px-6 py-2 font-medium ${
-                  mode === 'reclaimify' 
-                    ? 'bg-black text-white' 
-                    : 'bg-white text-black hover:bg-gray-100'
-                } transition-colors duration-200`}
-              >
-                Re-claimify
-              </button>
-            </div>
-          </div>
-          
-          <p className="text-gray-600 text-sm">
-            {mode === 'analyze' 
-              ? 'Full analysis with fact-checking' 
-              : mode === 'claimify' 
-                ? 'Extract and view content' 
-                : 'Re-analyze and extract content'}
-          </p>*/}
-        </div>
-        
-        <div className="bg-white p-6 border-2 border-black">
-          <div className="flex flex-col sm:flex-row gap-3 w-full">
-            <div className="relative flex-1">
-              <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                <svg className="h-5 w-5 text-black" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                </svg>
-              </div>
-              <input
-                type="text"
-                placeholder="Paste your link here..."
-                className="w-full pl-10 pr-4 py-4 border-2 border-black rounded-none focus:outline-none focus:ring-0 focus:border-black transition-all duration-200 font-mono placeholder-gray-500 text-black bg-white"
-                value={url}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setUrl(e.target.value)}
-                onKeyDown={handleKeyDown}
-                disabled={isLoading}
-              />
-            </div>
-            <button 
-              onClick={mode === 'analyze' ? handleAnalyze : handleClaimify}
-              disabled={isLoading}
-              className={`bg-black text-white font-medium py-4 px-8 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200 flex-shrink-0 ${isLoading ? 'opacity-70 cursor-not-allowed' : ''}`}
-            >
-              {isLoading 
-                ? (mode === 'analyze' 
-                    ? 'ANALYZING...' 
-                    : 'PROCESSING...') 
-                : mode === 'analyze' 
-                  ? 'ANALYZE' 
-                  : mode === 'claimify' 
-                    ? 'EXTRACT' 
-                    : 'RE-EXTRACT'}
-            </button>
-          </div>
-          
-          {error && (
-            <div className="mt-4 p-3 bg-red-100 text-red-700 border border-red-300">
-              {error}
-            </div>
-          )}
-
-          {(reclaimifyData || isAnalyzingClaims || loadingState.step5) && (
-            <div className="mt-6 p-4 bg-white border border-black rounded">
-              <div className="flex border-b border-gray-200 mb-4">
-                <button
-                  className={`py-2 px-4 font-medium text-sm ${
-                    activeTab === 'analysis' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:text-gray-700'
-                  }`}
-                  onClick={() => setActiveTab('analysis')}
+  // Left Sidebar Component
+  const leftSidebar = (
+    <div className="h-full flex flex-col">
+      <div className="p-4 border-b border-gray-200">
+        <h2 className="font-bold text-lg">Requests</h2>
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        {requestLogs.length === 0 ? (
+          <div className="text-sm text-gray-600 p-4">No requests yet</div>
+        ) : (
+          <div className="divide-y divide-gray-200">
+            {requestLogs.map((log) => {
+              const ar = activeRequests.find(a => a.id === log.id);
+              const isSel = selectedRequestId === log.id;
+              return (
+                <button 
+                  key={log.id} 
+                  onClick={() => setSelectedRequestId(log.id)}
+                  className={`w-full text-left p-3 hover:bg-gray-50 ${isSel ? 'bg-blue-50' : ''}`}
                 >
-                  Claimify Analysis
-                </button>
-                <button
-                  className={`py-2 px-4 font-medium text-sm ${
-                    activeTab === 'summary' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:text-gray-700'
-                  }`}
-                  onClick={() => setActiveTab('summary')}
-                >
-                  Analysis Summary
-                </button>
-              </div>
-              
-              <div className={activeTab === 'analysis' ? 'block' : 'hidden'}>
-                {reclaimifyData && <ReclaimifyResponseViewer data={reclaimifyData} />}
-              </div>
-              
-              <div className={activeTab === 'summary' ? 'block' : 'hidden'}>
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
-                {/* Box 1: Total Claims - Shows immediately after claims extraction */}
-                <div className="p-2 bg-gray-100 border border-gray-300 rounded">
-                  <div className="text-gray-800">Total Claims</div>
-                  <div className="font-semibold text-black">
-                    {loadingState.step1 ? (
-                      <div className="flex items-center">
-                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-black mr-2"></div>
-                        Loading...
-                      </div>
-                    ) : (
-                      analysisState.totalClaims || 0
-                    )}
+                  <div className="flex items-center justify-between">
+                    <span className={`text-sm font-mono truncate ${log.status === 'error' ? 'text-red-600' : 'text-gray-900'}`}>
+                      {log.method} {log.url}
+                    </span>
+                    <span className={`inline-block w-2 h-2 rounded-full ${
+                      log.status === 'success' ? 'bg-green-500' : 
+                      log.status === 'error' ? 'bg-red-500' : 'bg-yellow-500'
+                    }`}></span>
                   </div>
-                </div>
-
-                {/* Box 2: Analyzed - Updates after batch analysis */}
-                <div className="p-2 bg-gray-100 border border-gray-300 rounded">
-                  <div className="text-gray-800">Analyzed</div>
-                  <div className="font-semibold text-black">
-                    {loadingState.step1 || loadingState.step2 || loadingState.step3 || loadingState.step4 ? (
-                      <div className="flex items-center">
-                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-black mr-2"></div>
-                        {analysisState.analyzedCount || 0} / {analysisState.totalClaims || 0}
-                      </div>
-                    ) : (
-                      `${analysisState.analyzedCount || 0} / ${analysisState.totalClaims || 0}`
-                    )}
+                  <div className="text-xs text-gray-500 mt-1">
+                    {new Date(log.timestamp).toLocaleTimeString()}
                   </div>
-                </div>
-
-                {/* Box 3 & 4: Verdicts - Shows title immediately, loads data after fact-checking */}
-                <div className="p-2 bg-gray-100 border border-gray-300 rounded col-span-2 md:col-span-2">
-                  <div className="text-gray-800">Verdicts</div>
-                  <div className="flex flex-wrap gap-2 mt-1">
-                    {loadingState.step1 || loadingState.step2 || loadingState.step3 || loadingState.step4 ? (
-                      <div className="flex items-center w-full">
-                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-black mr-2"></div>
-                        <span className="text-gray-600">Analyzing claims...</span>
-                      </div>
-                    ) : (
-                      <>
-                        <span className="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded">
-                          Support: {analysisState.verdicts?.support || 0}
-                        </span>
-                        <span className="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded">
-                          Partially: {analysisState.verdicts?.partially || 0}
-                        </span>
-                        <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
-                          Unclear: {analysisState.verdicts?.unclear || 0}
-                        </span>
-                        <span className="text-xs bg-red-100 text-red-800 px-2 py-0.5 rounded">
-                          Contradict: {analysisState.verdicts?.contradict || 0}
-                        </span>
-                        <span className="text-xs bg-red-100 text-red-800 px-2 py-0.5 rounded">
-                          Refute: {analysisState.verdicts?.refute || 0}
-                        </span>
-                      </>
-                    )}
-                  </div>
-                </div>
-
-                {/* Box 5: Avg. Trust Score - Shows title immediately, loads data after fact-checking */}
-                <div className="p-2 bg-blue-50 border border-blue-300 rounded">
-                  <div className="text-gray-800">Avg. Trust Score</div>
-                  <div className="text-2xl font-extrabold text-blue-700">
-                    {loadingState.step1 || loadingState.step2 || loadingState.step3 || loadingState.step4 ? (
-                      <div className="flex items-center justify-center">
-                        <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-700"></div>
-                      </div>
-                    ) : (
-                      typeof analysisState.avgTrustScore === 'number' 
-                        ? analysisState.avgTrustScore.toFixed(2) 
-                        : '0.00'
-                    )}
-                  </div>
-                </div>
-
-                {/* Box 6: Opinion Bias (on Not Verifiable items) */}
-                <div className="p-2 bg-purple-50 border border-purple-300 rounded col-span-2">
-                  <div className="text-gray-800">Opinion Bias (Not Verifiable)</div>
-                  {loadingState.step1 || loadingState.step2 || loadingState.step3 || loadingState.step4 ? (
-                    <div className="flex items-center w-full mt-1">
-                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-purple-700 mr-2"></div>
-                      <span className="text-gray-600">Classifying opinions...</span>
-                    </div>
-                  ) : (
-                    <div className="flex flex-wrap gap-2 mt-1 items-center">
-                      <span className="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded">
-                        Positive: {analysisState.bias?.positivePercent ?? 0}%
-                      </span>
-                      <span className="text-xs bg-red-100 text-red-800 px-2 py-0.5 rounded">
-                        Negative: {analysisState.bias?.negativePercent ?? 0}%
-                      </span>
-                      <span className="text-xs bg-gray-100 text-gray-800 px-2 py-0.5 rounded">
-                        Other: {analysisState.bias?.otherPercent ?? 0}%
-                      </span>
-                      <span className="ml-auto text-xs text-gray-600">
-                        Total: {analysisState.bias?.total ?? 0}
-                      </span>
+                  {log.status === 'pending' && (
+                    <div className="mt-1 w-full bg-gray-200 h-1.5">
+                      <div 
+                        className="bg-blue-600 h-1.5 transition-all duration-300" 
+                        style={{ width: `${ar?.progress ?? 0}%` }} 
+                      />
                     </div>
                   )}
-                </div>
-                </div>
-              </div>
-            </div>
-          )}
-          </div>
-
-          <div className="mt-6 flex flex-col sm:flex-row gap-3 justify-center">
-            <a
-              href="/api/download/extension"
-              className="bg-black text-white font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200 text-center"
-            >
-              DOWNLOAD EXTENSION
-            </a>
-            <button
-              onClick={() => setShowInstall(true)}
-              className="bg-white text-black font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200 text-center"
-            >
-              HOW TO INSTALL
-            </button>
-            {/* Toggle Claims Panel Button - Show when claims exist but panel is closed */}
-            {claims && !showClaimsPanel && (
-              <button
-                onClick={() => setShowClaimsPanel(true)}
-                className="bg-white text-black font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200 text-center"
-              >
-                VIEW CLAIMS
-              </button>
-            )}
-          </div>
-
-          {showInstall && (
-            <div
-              className="fixed inset-0 z-50 flex items-center justify-center"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="install-extension-title"
-            >
-              <div className="absolute inset-0 bg-black/50" onClick={() => setShowInstall(false)} />
-              <div className="relative z-10 w-full max-w-lg mx-4 bg-white p-8 rounded-none border-2 border-black shadow-[8px_8px_0_0_rgba(0,0,0,1)]">
-                <div className="flex items-start justify-between">
-                  <h2 id="install-extension-title" className="text-2xl font-black text-black tracking-tight">Install the Chrome extension</h2>
-                  <button
-                    onClick={() => setShowInstall(false)}
-                    className="ml-4 -mt-2 text-black border-2 border-black px-2 py-1 hover:bg-black hover:text-white transition-all duration-200"
-                    aria-label="Close"
-                  >
-                    ✕
-                  </button>
-                </div>
-                <ol className="mt-4 list-decimal list-inside space-y-2 text-gray-900 text-sm text-left">
-                  <li>Click <span className="font-semibold">DOWNLOAD EXTENSION</span> on the main page to get <code className="font-mono">extension.zip</code>.</li>
-                  <li>Extract the ZIP to a folder on your computer.</li>
-                  <li>Open Chrome and go to <span className="font-mono">chrome://extensions</span>.</li>
-                  <li>Enable <span className="font-semibold">Developer mode</span> (top-right).</li>
-                  <li>Click <span className="font-semibold">Load unpacked</span> and select the extracted <code className="font-mono">extension/</code> folder.</li>
-                  <li>Pin the extension from the toolbar for quick access.</li>
-                </ol>
-                <div className="mt-6 flex justify-end gap-3">
-                  <a
-                    href="/api/download/extension"
-                    className="bg-black text-white font-medium py-2 px-4 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200"
-                  >
-                    Download ZIP
-                  </a>
-                  <button
-                    onClick={() => setShowInstall(false)}
-                    className="bg-white text-black font-medium py-2 px-4 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200"
-                  >
-                    Close
-                  </button>
-                </div>
-                <p className="text-xs text-gray-700 mt-4">
-                  To update later, remove the old version in <span className="font-mono">chrome://extensions</span> and load the new extracted folder again.
-                </p>
-              </div>
-            </div>
-          )}
-        </div>
-        {/* Right Panel - Claims List (slides in from right) */}
-        {showClaimsPanel && claims && (
-          <div className={`w-1/2 flex-shrink-0 transition-all duration-500 ease-in-out transform ${
-            showClaimsPanel ? 'translate-x-0 opacity-100' : 'translate-x-full opacity-0'
-          }`}>
-            <div className="bg-white border-2 border-black rounded-none shadow-[8px_8px_0_0_rgba(0,0,0,1)] h-[600px] flex flex-col">
-              {/* Panel Header */}
-              <div className="flex items-center justify-between p-4 border-b-2 border-black">
-                <h3 className="font-bold text-black text-lg">Extracted Claims</h3>
-                <button
-                  onClick={() => setShowClaimsPanel(false)}
-                  className="text-black border-2 border-black px-2 py-1 hover:bg-black hover:text-white transition-all duration-200 font-bold"
-                  aria-label="Close claims panel"
-                >
-                  ✕
                 </button>
-              </div>
-              
-              {/* Panel Content with Custom Scrollbar */}
-              <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
-                <ClaimsList 
-                  claims={claims} 
-                  searchResults={claims?.searchResults} 
-                />
-              </div>
-            </div>
+              );
+            })}
           </div>
         )}
       </div>
     </div>
   );
-}
+
+  // Main Content Component
+  const mainContent = (
+    <div className="space-y-6">
+      {/* URL Input */}
+      <div className="bg-white p-6 border-2 border-black">
+        <div className="flex flex-col sm:flex-row gap-3 w-full">
+          <div className="relative flex-1">
+            <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+              <svg className="h-5 w-5 text-black" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+              </svg>
+            </div>
+            <input
+              type="text"
+              placeholder="Paste your link here..."
+              className="w-full pl-10 pr-4 py-4 border-2 border-black rounded-none focus:outline-none focus:ring-0 focus:border-black transition-all duration-200 font-mono placeholder-gray-500 text-black bg-white"
+              value={url}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setUrl(e.target.value)}
+              onKeyDown={handleKeyDown}
+              disabled={isLoading}
+            />
+          </div>
+          <button 
+            onClick={mode === 'analyze' ? handleAnalyze : handleClaimify}
+            disabled={isLoading}
+            className={`bg-black text-white font-medium py-4 px-8 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200 flex-shrink-0 ${isLoading ? 'opacity-70 cursor-not-allowed' : ''}`}
+          >
+            {isLoading 
+              ? (mode === 'analyze' ? 'ANALYZING...' : 'PROCESSING...') 
+              : mode === 'analyze' ? 'ANALYZE' : 'EXTRACT'}
+          </button>
+        </div>
+        
+        {error && (
+          <div className="mt-4 p-3 bg-red-100 text-red-700 border border-red-300">
+            {error}
+          </div>
+        )}
+
+        {(reclaimifyData || isAnalyzingClaims || loadingState.step5) && (
+          <div className="mt-6">
+            <div className="flex border-b border-gray-200 mb-4">
+              <button
+                className={`py-2 px-4 font-medium text-sm ${
+                  activeTab === 'analysis' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:text-gray-700'
+                }`}
+                onClick={() => setActiveTab('analysis')}
+              >
+                Claimify Analysis
+              </button>
+              <button
+                className={`py-2 px-4 font-medium text-sm ${
+                  activeTab === 'summary' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:text-gray-700'
+                }`}
+                onClick={() => setActiveTab('summary')}
+              >
+                Analysis Summary
+              </button>
+            </div>
+            
+            <div className={activeTab === 'analysis' ? 'block' : 'hidden'}>
+              {reclaimifyData && <ReclaimifyResponseViewer data={reclaimifyData} />}
+            </div>
+            
+            <div className={activeTab === 'summary' ? 'block' : 'hidden'}>
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
+                <div className="p-3 bg-gray-50 border border-gray-200 rounded">
+                  <div className="text-gray-600 text-xs uppercase font-medium">Total Claims</div>
+                  <div className="text-2xl font-bold text-gray-900 mt-1">
+                    {loadingState.step1 ? '...' : analysisState.totalClaims || 0}
+                  </div>
+                </div>
+                <div className="p-3 bg-gray-50 border border-gray-200 rounded">
+                  <div className="text-gray-600 text-xs uppercase font-medium">Avg. Trust Score</div>
+                  <div className="text-2xl font-bold text-blue-600 mt-1">
+                    {typeof analysisState.avgTrustScore === 'number' ? 
+                      analysisState.avgTrustScore.toFixed(2) : '0.00'}
+                  </div>
+                </div>
+                <div className="p-3 bg-gray-50 border border-green-100 rounded">
+                  <div className="text-gray-600 text-xs uppercase font-medium">Support</div>
+                  <div className="text-2xl font-bold text-green-600 mt-1">
+                    {analysisState.verdicts?.support || 0}
+                  </div>
+                </div>
+                <div className="p-3 bg-gray-50 border border-blue-100 rounded">
+                  <div className="text-gray-600 text-xs uppercase font-medium">Partially Support</div>
+                  <div className="text-2xl font-bold text-blue-500 mt-1">
+                    {analysisState.verdicts?.partially || 0}
+                  </div>
+                </div>
+                <div className="p-3 bg-gray-50 border border-yellow-100 rounded">
+                  <div className="text-gray-600 text-xs uppercase font-medium">Unclear</div>
+                  <div className="text-2xl font-bold text-yellow-600 mt-1">
+                    {analysisState.verdicts?.unclear || 0}
+                  </div>
+                </div>
+                <div className="p-3 bg-gray-50 border border-orange-100 rounded">
+                  <div className="text-gray-600 text-xs uppercase font-medium">Contradict</div>
+                  <div className="text-2xl font-bold text-orange-600 mt-1">
+                    {analysisState.verdicts?.contradict || 0}
+                  </div>
+                </div>
+                <div className="p-3 bg-gray-50 border border-red-100 rounded">
+                  <div className="text-gray-600 text-xs uppercase font-medium">Refute</div>
+                  <div className="text-2xl font-bold text-red-600 mt-1">
+                    {analysisState.verdicts?.refute || 0}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )} 
+      </div>
+
+      <div className="flex flex-col sm:flex-row gap-3 justify-center">
+        <a
+          href="/api/download/extension"
+          className="bg-black text-white font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200 text-center"
+        >
+          DOWNLOAD EXTENSION
+        </a>
+        <button
+          onClick={() => setShowInstall(true)}
+          className="bg-white text-black font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200 text-center"
+        >
+          HOW TO INSTALL
+        </button>
+      </div>
+    </div>
+  );
+
+  // Right Sidebar Component
+  const rightSidebar = (
+    <div className="h-full flex flex-col">
+      <div className="p-4 border-b border-gray-200">
+        <h2 className="font-bold text-lg">Overview</h2>
+      </div>
+      <div className="p-4 border-b border-gray-200">
+        <div className="text-gray-800 text-sm">Avg. Trust Score</div>
+        <div className="text-3xl font-extrabold text-blue-700">
+          {typeof analysisState.avgTrustScore === 'number' ? analysisState.avgTrustScore.toFixed(2) : '0.00'}
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto p-4">
+        <h3 className="font-medium text-gray-900 mb-2">Claims</h3>
+        <div className="space-y-2">
+          {claims ? (
+            <ClaimsList claims={claims} searchResults={claims?.searchResults} />
+          ) : (
+            <div className="text-sm text-gray-500">No claims yet. Analyze a URL to see claims.</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gray-100 flex flex-col">
+      {/* Header */}
+      <header className="bg-black text-white p-4">
+        <div className="container mx-auto">
+          <h1 className="text-2xl font-bold">LUMOUS</h1>
+          <p className="text-sm text-gray-300">Illuminate the truth behind every headline</p>
+        </div>
+      </header>
+      
+      {/* Main Content */}
+      <main className="flex-1">
+        <ThreeColumnLayout 
+          leftSidebar={leftSidebar}
+          mainContent={mainContent}
+          rightSidebar={rightSidebar}
+        />
+      </main>
+      
+      {/* Global Components */}
+      <InfoDialog />
+      <RequestProgressDialog activeRequests={activeRequests} />
+      
+      {/* Install Modal */}
+      {showInstall && (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="install-extension-title"
+      >
+        <div className="absolute inset-0 bg-black/50" onClick={() => setShowInstall(false)} />
+        <div className="relative z-10 w-full max-w-lg mx-4 bg-white p-8 rounded-none border-2 border-black shadow-[8px_8px_0_0_rgba(0,0,0,1)]">
+          <div className="flex items-start justify-between">
+            <h2 id="install-extension-title" className="text-2xl font-black text-black tracking-tight">Install the Chrome extension</h2>
+            <button
+              onClick={() => setShowInstall(false)}
+              className="ml-4 -mt-2 text-black border-2 border-black px-2 py-1 hover:bg-black hover:text-white transition-all duration-200"
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
+          <ol className="mt-4 list-decimal list-inside space-y-2 text-gray-900 text-sm text-left">
+            <li>Click <span className="font-semibold">DOWNLOAD EXTENSION</span> on the main page to get <code className="font-mono">extension.zip</code>.</li>
+            <li>Extract the ZIP to a folder on your computer.</li>
+            <li>Open Chrome and go to <span className="font-mono">chrome://extensions</span>.</li>
+            <li>Enable <span className="font-semibold">Developer mode</span> (top-right).</li>
+            <li>Click <span className="font-semibold">Load unpacked</span> and select the extracted <code className="font-mono">extension/</code> folder.</li>
+            <li>Pin the extension from the toolbar for quick access.</li>
+          </ol>
+          <div className="mt-6 flex justify-end gap-3">
+            <a
+              href="/api/download/extension"
+              className="bg-black text-white font-medium py-2 px-4 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200"
+            >
+              Download ZIP
+            </a>
+            <button
+              onClick={() => setShowInstall(false)}
+              className="bg-white text-black font-medium py-2 px-4 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200"
+            >
+              Close
+            </button>
+          </div>
+          <p className="text-xs text-gray-700 mt-4">
+            To update later, remove the old version in <span className="font-mono">chrome://extensions</span> and load the new extracted folder again.
+          </p>
+        </div>
+      </div>
+    )}
+  </div>
+)};

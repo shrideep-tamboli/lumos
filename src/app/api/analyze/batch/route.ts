@@ -49,6 +49,12 @@ function stripHtml(html: string): string {
   return cleanText(String(html).replace(/<[^>]*>/g, ' '));
 }
 
+function isPdfUrl(url: string): boolean {
+  return url.toLowerCase().endsWith('.pdf') || 
+         url.toLowerCase().includes('.pdf?') ||
+         url.toLowerCase().includes('/pdf/');
+}
+
 async function extractContent(url: string | UrlObject, claim?: string): Promise<ExtractContentResult> {
   // Handle case where url is not a string
   const urlString = typeof url === 'string' 
@@ -56,6 +62,15 @@ async function extractContent(url: string | UrlObject, claim?: string): Promise<
     : (url && typeof url === 'object' && 'url' in url) 
       ? String((url as UrlObject).url) 
       : String(url);
+
+  if (isPdfUrl(urlString)) {
+    return {
+      url: urlString,
+      content: '',
+      error: 'PDF content extraction not supported',
+      claim
+    };
+  }
 
   if (typeof urlString !== 'string' || !urlString.startsWith('http')) {
     return {

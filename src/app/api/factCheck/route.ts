@@ -391,11 +391,10 @@ Strictly output a JSON array where each element has these keys:
 - Verdict: One of ["Support","Partially Support","Unclear","Contradict","Refute"]
 - Reason: Short textual justification for the verdict referencing the evidence
 - Reference: Array of 1-3 exact quotes from the evidence (include source numbers like [Source 1])
-- Trust_Score: Number from -100 to 100 based on evidence strength
-  - 100: Strong support with multiple reliable sources
-  - 65: Partial support or single source
-  - 0: Unclear or conflicting evidence
-  - -100: Evidence contradicts the claim
+- Trust_Score: Number based on evidence strength
+  - 100: Support (claim is fully supported by evidence)
+  - 50: Partially Support (claim is partially supported by evidence)
+  - 0: Unclear/Contradict/Refute (insufficient or contradictory evidence, or evidence refutes the claim)
 
 Format example:
 [
@@ -404,7 +403,7 @@ Format example:
     "Verdict": "Support",
     "Reason": "Explain which sources support the verdict.",
     "Reference": ["[Source 1] Supporting evidence quote."],
-    "Trust_Score": 85
+    "Trust_Score": 100
   }
 ]`;
   

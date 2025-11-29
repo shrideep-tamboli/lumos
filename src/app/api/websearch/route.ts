@@ -3,6 +3,18 @@ import { tavily } from '@tavily/core';
 
 const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
 
+// Helper function to check if a URL points to a PDF
+function isPdfUrl(url: string): boolean {
+  return url.toLowerCase().endsWith('.pdf') || 
+         url.toLowerCase().includes('.pdf?') ||
+         url.toLowerCase().includes('/pdf/');
+}
+
+// Helper function to filter out PDF URLs from an array of URLs
+function filterPdfUrls(urls: string[]): string[] {
+  return urls.filter(url => !isPdfUrl(url));
+}
+
 interface Claim {
   claim: string;
   search_date: string;
@@ -69,18 +81,19 @@ async function googleSearch(query: string, originalUrl?: string): Promise<string
       return [];
     }
 
-    const results = (data.items || [])
-      .filter((item: GoogleCSEItem) => item.link && !item.link.includes('google.com'))
-      .map((item: GoogleCSEItem) => item.link as string)
-      .filter((url: string) => {
-        try {
-          const urlObj = new URL(url);
-          return !originalUrl || urlObj.hostname !== new URL(originalUrl).hostname;
-        } catch {
-          return false; // Skip invalid URLs
-        }
-      })
-      .slice(0, 3);
+    const results = filterPdfUrls(
+      (data.items || [])
+        .filter((item: GoogleCSEItem) => item.link && !item.link.includes('google.com'))
+        .map((item: GoogleCSEItem) => item.link as string)
+        .filter((url: string) => {
+          try {
+            const urlObj = new URL(url);
+            return !originalUrl || urlObj.hostname !== new URL(originalUrl).hostname;
+          } catch {
+            return false; // Skip invalid URLs
+          }
+        })
+    ).slice(0, 3);
 
     console.log(`Google CSE results for "${cleanQuery}":`, results);
     return results;
@@ -102,9 +115,11 @@ async function tavilySearch(query: string, originalUrl?: string): Promise<string
       max_results: 3
     });
 
-    return (tavilyResponse.results || [])
-      .map(r => r.url)
-      .filter((u: string | undefined): u is string => !!u);
+    return filterPdfUrls(
+      (tavilyResponse.results || [])
+        .map(r => r.url)
+        .filter((u: string | undefined): u is string => !!u)
+    );
   } catch (err) {
     console.error("Tavily failed:", err);
     return [];
@@ -126,11 +141,12 @@ async function duckduckgoSearch(query: string, originalUrl?: string): Promise<st
 
     const ddgData = await ddgResponse.json();
 
-    return (ddgData.organic_results || [])
-      .map((r: DDGOrganicResult) => r.link)
-      .filter((u?: string): u is string => !!u)
-      .filter((u: string) => !originalUrl || new URL(u).hostname !== new URL(originalUrl).hostname)
-      .slice(0, 3);
+    return filterPdfUrls(
+      (ddgData.organic_results || [])
+        .map((r: DDGOrganicResult) => r.link)
+        .filter((u?: string): u is string => !!u)
+        .filter((u: string) => !originalUrl || new URL(u).hostname !== new URL(originalUrl).hostname)
+    ).slice(0, 3);
   } catch (error) {
     console.error("DuckDuckGo fallback failed:", error);
     return [];

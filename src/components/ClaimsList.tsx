@@ -9,8 +9,15 @@ return (
     
     <div className="space-y-4">
       {claims.claims.map((claim, index) => {
-        const result: SearchResult | undefined = searchResults?.[index];
-        if (!result) return null;
+      // Prefer one-to-one alignment with claims order; fallback to heuristic match
+      const result = (Array.isArray(searchResults) ? searchResults[index] : undefined) ||
+        searchResults.find(sr => 
+          sr?.content?.includes?.(claim.claim) || 
+          sr?.reference?.includes?.(claim.claim) ||
+          sr?.relevantChunks?.some?.(chunk => chunk.text && chunk.text.includes(claim.claim))
+        );
+
+      if (!result) return null;
 
         return (
           <div key={index} className="p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
