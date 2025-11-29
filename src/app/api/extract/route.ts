@@ -117,6 +117,25 @@ function isXPostUrl(url: string): boolean {
 }
 
 /**
+ * Check if URL is any X.com/Twitter URL (but not a direct post)
+ * These URLs (trending, search, profiles) require JavaScript and won't work with our extractors
+ */
+function isUnsupportedXUrl(url: string): boolean {
+  const xDomainPattern = /^(https?:\/\/)?(www\.)?(x\.com|twitter\.com)\//i;
+  // It's an X URL but NOT a direct post URL
+  return xDomainPattern.test(url.trim()) && !isXPostUrl(url);
+}
+
+/**
+ * Check if URL is any Instagram URL (but not a direct post)
+ * These URLs (profiles, explore, stories) require JavaScript and won't work
+ */
+function isUnsupportedInstagramUrl(url: string): boolean {
+  const instagramDomainPattern = /^(https?:\/\/)?(www\.)?(instagram\.com|instagr\.am)\//i;
+  return instagramDomainPattern.test(url.trim()) && !isInstagramPostUrl(url);
+}
+
+/**
  * Poll Supadata transcript job status
  */
 async function pollSupadataJob(jobId: string, apiKey: string): Promise<SupadataTranscriptResponse> {
@@ -454,6 +473,28 @@ export async function GET(request: Request) {
   }
 
   try {
+    // Check for unsupported X/Twitter URLs (trending, search, profiles)
+    if (isUnsupportedXUrl(url)) {
+      return NextResponse.json(
+        { 
+          error: 'Unsupported X/Twitter URL', 
+          details: 'Only direct post URLs are supported (e.g., x.com/username/status/123456789). Trending pages, search results, and profile pages cannot be extracted. Please copy the URL of a specific post/tweet.' 
+        },
+        { status: 400 }
+      );
+    }
+
+    // Check for unsupported Instagram URLs (profiles, explore, stories)
+    if (isUnsupportedInstagramUrl(url)) {
+      return NextResponse.json(
+        { 
+          error: 'Unsupported Instagram URL', 
+          details: 'Only direct post URLs are supported (e.g., instagram.com/p/ABC123 or instagram.com/reel/ABC123). Profile pages, stories, and explore pages cannot be extracted. Please copy the URL of a specific post.' 
+        },
+        { status: 400 }
+      );
+    }
+
     let extractedData;
     
     // Check if it's a YouTube URL
@@ -489,6 +530,28 @@ export async function POST(request: Request) {
     if (!url || typeof url !== 'string') {
       return NextResponse.json(
         { error: 'URL is required in the request body' },
+        { status: 400 }
+      );
+    }
+
+    // Check for unsupported X/Twitter URLs (trending, search, profiles)
+    if (isUnsupportedXUrl(url)) {
+      return NextResponse.json(
+        { 
+          error: 'Unsupported X/Twitter URL', 
+          details: 'Only direct post URLs are supported (e.g., x.com/username/status/123456789). Trending pages, search results, and profile pages cannot be extracted. Please copy the URL of a specific post/tweet.' 
+        },
+        { status: 400 }
+      );
+    }
+
+    // Check for unsupported Instagram URLs (profiles, explore, stories)
+    if (isUnsupportedInstagramUrl(url)) {
+      return NextResponse.json(
+        { 
+          error: 'Unsupported Instagram URL', 
+          details: 'Only direct post URLs are supported (e.g., instagram.com/p/ABC123 or instagram.com/reel/ABC123). Profile pages, stories, and explore pages cannot be extracted. Please copy the URL of a specific post.' 
+        },
         { status: 400 }
       );
     }

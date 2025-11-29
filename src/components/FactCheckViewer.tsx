@@ -68,16 +68,17 @@ export default function FactCheckViewer({ claims, factCheckResults, isLoading }:
     <div className="space-y-4">
       {/* Header with progress */}
       <div className="flex items-center justify-between mb-4">
-        <h3 className="text-lg font-bold text-gray-900">Fact Check Results</h3>
+        <h3>
+          {checkedCount > 0 && (
+            <span className={`text-lg font-bold ${getScoreColor(avgScore)}`}>
+              Trust Score: {avgScore}%
+            </span>
+          )}
+        </h3>
         <div className="flex items-center gap-4">
           <span className="text-sm text-gray-500">
             {checkedCount}/{totalCount} claims verified
           </span>
-          {checkedCount > 0 && (
-            <span className={`text-sm font-bold ${getScoreColor(avgScore)}`}>
-              Avg: {avgScore}%
-            </span>
-          )}
         </div>
       </div>
 

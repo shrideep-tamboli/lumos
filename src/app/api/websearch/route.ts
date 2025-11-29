@@ -43,7 +43,7 @@ interface DDGOrganicResult {
 // --- GOOGLE Programmable Search Engine Search ---
 async function googleSearch(query: string, originalUrl?: string): Promise<string[]> {
   try {
-    // Remove date from query as it might be too restrictive
+    // Remove trailing ISO date from query as it might be too restrictive
     const cleanQuery = query.replace(/\d{4}-\d{2}-\d{2}$/, '').trim();
     
     // Build search parameters
@@ -161,8 +161,19 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'No claims provided' }, { status: 400 });
     }
 
+    // Sanitize claim text (remove placeholders like [Date])
+    const sanitizeClaimQuery = (text: string): string => {
+      return text
+        .replace(/\[[^\]]+\]/g, ' ') // remove [Placeholders]
+        .replace(/[“”]/g, '"')
+        .replace(/[’]/g, "'")
+        .replace(/\s+/g, ' ')
+        .trim();
+    };
+
     const searchPromises = claims.map(async (claim) => {
-      const searchQuery = `${claim.claim} ${claim.search_date || ''}`.trim();
+      const base = sanitizeClaimQuery(claim.claim || '');
+      const searchQuery = `${base} ${claim.search_date || ''}`.trim();
 
       let urls: string[] = [];
       let source = 'none';

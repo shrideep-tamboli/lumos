@@ -6,8 +6,6 @@ import { v4 as uuidv4 } from 'uuid';
 import ClaimsList from '@/components/ClaimsList';
 import InfoDialog from '@/components/InfoDialog';
 import { ReclaimifyResponseViewer } from '@/components/ReclaimifyResponseViewer';
-import { RequestLog } from '@/components/RequestLogger';
-import { RequestProgressDialog } from '@/components/RequestProgressDialog';
 import { ThreeColumnLayout } from '@/components/ThreeColumnLayout';
 import WebSearchViewer from '@/components/WebSearchViewer';
 import FactCheckViewer from '@/components/FactCheckViewer';
@@ -123,18 +121,6 @@ export default function Home() {
   });
 
   const [, setShowClaimsPanel] = useState(false);
-  // Request logging state (used by logRequest/updateRequestLog callbacks)
-  const [, setRequestLogs] = useState<RequestLog[]>([]);
-  const [activeRequests, setActiveRequests] = useState<Array<{
-    id: string;
-    method: string;
-    url: string;
-    status: 'pending' | 'success' | 'error';
-    progress?: number;
-  }>>([]);
-  
-  const progressIntervals = useRef<Record<string, NodeJS.Timeout>>({});
-  const [, setSelectedRequestId] = useState<string | null>(null);
 
   // Step navigation states
   const [selectedStep, setSelectedStep] = useState<AnalysisStep>(null);
@@ -143,99 +129,31 @@ export default function Home() {
   const [factCheckResults, setFactCheckResults] = useState<FactCheckResult[]>([]);
   const [batchResults, setBatchResults] = useState<BatchAnalysisResult[]>([]);
 
-  const logRequest = useCallback((log: Omit<RequestLog, 'id' | 'timestamp'>) => {
-    const id = uuidv4();
-    const timestamp = new Date();
-    
-    // Add to active requests
-    setActiveRequests(prev => [
-      ...prev,
-      {
-        id,
-        method: log.method,
-        url: log.url,
-        status: log.status,
-        progress: 0
-      }
-    ]);
-    
-    // Start progress animation
-    progressIntervals.current[id] = setInterval(() => {
-      setActiveRequests(prev => 
-        prev.map(req => 
-          req.id === id && req.status === 'pending' && req.progress !== undefined && req.progress < 90
-            ? { ...req, progress: req.progress + 10 }
-            : req
-        )
-      );
-    }, 500);
-    
-    // Add new log to the end of the array (chronological order)
-    setRequestLogs(prevLogs => [
-      ...prevLogs,
-      {
-        id,
-        timestamp,
-        ...log
-      }
-    ]);
-    
-    setSelectedRequestId(id);
-    return id;
-  }, []);
-
-  const updateRequestLog = useCallback((id: string, updates: Partial<Omit<RequestLog, 'id' | 'timestamp'>>) => {
-    setRequestLogs(prevLogs =>
-      prevLogs.map(log =>
-        log.id === id ? { ...log, ...updates } : log
-      )
-    );
-    
-    // Update active requests
-    if (updates.status && updates.status !== 'pending') {
-      // Clear the progress interval for this request
-      if (progressIntervals.current[id]) {
-        clearInterval(progressIntervals.current[id]);
-        delete progressIntervals.current[id];
-      }
-      
-      // Update the request status
-      setActiveRequests(prev => 
-        prev.map(req => 
-          req.id === id 
-            ? { 
-                ...req, 
-                status: updates.status as 'success' | 'error',
-                progress: 100 
-              }
-            : req
-        )
-      );
-      
-      // Remove from active requests after a delay
-      setTimeout(() => {
-        setActiveRequests(prev => prev.filter(req => req.id !== id));
-      }, 1000);
+  const isProbablyUrl = (value: string): boolean => {
+    const v = value.trim();
+    if (!v) return false;
+    if (/^https?:\/\//i.test(v)) return true;
+    if (/^www\./i.test(v)) return true;
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(v)) return true; // any scheme://
+    if(/[\s\n]/.test(v)) return false; // spaces/newlines -> likely text
+    // domain.tld/path pattern
+    if (/^[^\s]+\.[^\s]{2,}(\/|$)/.test(v)) return true;
+    try {
+      // new URL will throw for plain text
+      // eslint-disable-next-line no-new
+      new URL(v.startsWith('http') ? v : `https://${v}`);
+      return true;
+    } catch {
+      return false;
     }
-  }, []);
-
-  // Clean up intervals on unmount
-  useEffect(() => {
-    const currentIntervals = progressIntervals.current;
-    return () => {
-      Object.values(currentIntervals).forEach(interval => clearInterval(interval));
-    };
-  }, []);
+  };
 
   const handleAnalyze = async () => {
     if (!url.trim()) {
-      setError('Please enter a URL');
+      setError('Please enter a URL or text');
       return;
     }
     
-    // Clear previous logs when starting a new analysis
-    setRequestLogs([]);
-
     setIsLoading(true);
     setError(null);
     setResult(null);
@@ -256,67 +174,49 @@ export default function Home() {
     setShowClaimsPanel(false);
 
     try {
-      // 1. Extract text from URL (handles both regular URLs and YouTube URLs)
+      // 1. Extract or accept plain text
       setLoadingState(prev => ({ ...prev, step1: true }));
       
-      const extractUrl = `/api/extract?url=${encodeURIComponent(url.trim())}`;
-      const extractLogId = logRequest({
-        method: 'GET',
-        url: extractUrl,
-        status: 'pending',
-        requestBody: { url: url.trim() }
-      });
-      
-      let extractResponse: Response;
       let extractDataResponse: { url?: string; content?: string; title?: string; excerpt?: string; error?: string };
+      const inputVal = url.trim();
+      const inputIsUrl = isProbablyUrl(inputVal);
       
-      try {
-        extractResponse = await fetch(extractUrl);
-        extractDataResponse = await extractResponse.json();
+      if (inputIsUrl) {
+        const extractUrl = `/api/extract?url=${encodeURIComponent(inputVal)}`;
         
-        updateRequestLog(extractLogId, {
-          status: extractResponse.ok ? 'success' : 'error',
-          response: extractDataResponse,
-          error: extractResponse.ok ? undefined : extractDataResponse.error || 'Failed to extract content'
-        });
-        
-        if (!extractResponse.ok) {
-          throw new Error(extractDataResponse.error || 'Failed to extract content from URL');
+        let extractResponse: Response;
+        try {
+          extractResponse = await fetch(extractUrl);
+          extractDataResponse = await extractResponse.json();
+          
+          if (!extractResponse.ok) {
+            throw new Error(extractDataResponse.error || 'Failed to extract content from URL');
+          }
+        } catch (err) {
+          throw err;
         }
-        
         // Save extract data for step navigation
         setExtractData({
-          url: extractDataResponse.url || url.trim(),
+          url: extractDataResponse.url || inputVal,
           content: extractDataResponse.content || '',
           title: extractDataResponse.title,
           excerpt: extractDataResponse.excerpt
         });
         setSelectedStep('extract');
-      } catch (err) {
-        updateRequestLog(extractLogId, {
-          status: 'error',
-          error: err instanceof Error ? err.message : 'Unknown error during extraction'
-        });
-        throw err;
+      } else {
+        // Treat input as plain text and skip extract API
+        extractDataResponse = { url: '', content: inputVal };
+        setExtractData({ url: '', content: inputVal });
+        setSelectedStep('extract');
       }
       
       // 2. Send extracted content to reclaimify for processing (works for both regular URLs and YouTube URLs)
       const reclaimifyPayload = {
-        url: extractDataResponse.url || url.trim(),
+        url: extractDataResponse.url || (isProbablyUrl(url.trim()) ? url.trim() : undefined),
         content: extractDataResponse.content,
         title: extractDataResponse.title,
         excerpt: extractDataResponse.excerpt
       };
-      
-      const reclaimifyLogId = logRequest({
-        method: 'POST',
-        url: '/api/reclaimify',
-        status: 'pending',
-        requestBody: {
-          ...reclaimifyPayload,
-          content: reclaimifyPayload.content ? '[content truncated]' : null
-        }
-      });
       
       let reclaimifyResponse: Response;
       let reclaimifyDataResponse: ReclaimifyApiResponse;
@@ -330,20 +230,10 @@ export default function Home() {
         
         reclaimifyDataResponse = await reclaimifyResponse.json();
         
-        updateRequestLog(reclaimifyLogId, {
-          status: reclaimifyResponse.ok ? 'success' : 'error',
-          response: reclaimifyDataResponse,
-          error: reclaimifyResponse.ok ? undefined : (reclaimifyDataResponse as ReclaimifyApiResponse & { error?: string }).error || 'Failed to process content'
-        });
-        
         if (!reclaimifyResponse.ok) {
           throw new Error((reclaimifyDataResponse as ReclaimifyApiResponse & { error?: string }).error || 'Failed to process content');
         }
       } catch (err) {
-        updateRequestLog(reclaimifyLogId, {
-          status: 'error',
-          error: err instanceof Error ? err.message : 'Unknown error during reclaimify processing'
-        });
         throw err;
       }
       setReclaimifyData(reclaimifyDataResponse);
@@ -429,15 +319,8 @@ export default function Home() {
       const webSearchPayload = { 
         claims: claimsData.claims,
         search_date: searchDate,
-        originalUrl: url.trim()
+        ...(isProbablyUrl(url.trim()) ? { originalUrl: url.trim() } : {})
       };
-      
-      const webSearchLogId = logRequest({
-        method: 'POST',
-        url: '/api/websearch',
-        status: 'pending',
-        requestBody: webSearchPayload
-      });
       
       let webSearchResponse: Response;
       let webSearchData: WebSearchResponse;
@@ -451,20 +334,10 @@ export default function Home() {
         
         webSearchData = await webSearchResponse.json() as WebSearchResponse;
         
-        updateRequestLog(webSearchLogId, {
-          status: webSearchResponse.ok ? 'success' : 'error',
-          response: webSearchData,
-          error: webSearchResponse.ok ? undefined : 'Failed to perform web search'
-        });
-        
         if (!webSearchResponse.ok) {
           throw new Error('Failed to perform web search');
         }
       } catch (err) {
-        updateRequestLog(webSearchLogId, {
-          status: 'error',
-          error: err instanceof Error ? err.message : 'Unknown error during web search'
-        });
         throw err;
       }
       
@@ -500,13 +373,6 @@ export default function Home() {
       
       if (flattenedUrls.length === 0) {
         const errorMsg = 'No valid URLs found for analysis';
-        logRequest({
-          method: 'POST',
-          url: '/api/analyze/batch',
-          status: 'error',
-          requestBody: { urls: [], claims: claimsOnePerUrl },
-          error: errorMsg
-        });
         throw new Error(errorMsg);
       }
       
@@ -514,19 +380,6 @@ export default function Home() {
         urls: flattenedUrls,
         claims: claimsOnePerUrl
       };
-      
-      const batchLogId = logRequest({
-        method: 'POST',
-        url: '/api/analyze/batch',
-        status: 'pending',
-        requestBody: {
-          ...batchPayload,
-          urls: batchPayload.urls.map(url => ({
-            url: url,
-            content: '[content truncated]'
-          }))
-        }
-      });
       
       let batchResponse: Response;
       let batchData: { results?: unknown[] } = {};
@@ -540,21 +393,11 @@ export default function Home() {
         
         batchData = await batchResponse.json();
         
-        updateRequestLog(batchLogId, {
-          status: batchResponse.ok ? 'success' : 'error',
-          response: batchData,
-          error: batchResponse.ok ? undefined : 'Batch analysis failed'
-        });
-        
         if (!batchResponse.ok) {
           console.error('Batch analysis failed:', batchData);
           throw new Error('Failed to analyze content');
         }
       } catch (err) {
-        updateRequestLog(batchLogId, {
-          status: 'error',
-          error: err instanceof Error ? err.message : 'Unknown error during batch analysis'
-        });
         throw err;
       }
 
@@ -597,13 +440,6 @@ export default function Home() {
         
         // Create a promise for each claim's fact check
         const factCheckPromises = factCheckClaims.map(claimData => {
-          const fcLogId = logRequest({
-            method: 'POST',
-            url: '/api/factCheck',
-            status: 'pending',
-            requestBody: { claims: [claimData] }
-          });
-
           return fetch('/api/factCheck', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -611,11 +447,6 @@ export default function Home() {
           })
           .then(async (r) => {
             const json = await r.json().catch(() => null);
-            updateRequestLog(fcLogId, {
-              status: r.ok ? 'success' : 'error',
-              response: json || undefined,
-              error: r.ok ? undefined : 'Failed to perform fact checking'
-            });
             if (!r.ok) {
               console.error('Failed to perform fact checking for claim:', claimData.claim);
               return null;
@@ -623,7 +454,6 @@ export default function Home() {
             return json;
           })
           .catch(error => {
-            updateRequestLog(fcLogId, { status: 'error', error: String(error) });
             console.error('Error in fact check request:', error);
             return null;
           });
@@ -631,12 +461,6 @@ export default function Home() {
 
         // Bias request (only if we have items)
         if (notVerifiableItems.length > 0) {
-          const biasLogId = logRequest({
-            method: 'POST',
-            url: '/api/bias',
-            status: 'pending',
-            requestBody: { items: notVerifiableItems.length }
-          });
           requests.push(
             fetch('/api/bias', {
               method: 'POST',
@@ -644,15 +468,9 @@ export default function Home() {
               body: JSON.stringify({ items: notVerifiableItems })
             }).then(async (r) => {
               const json = await r.json().catch(() => null);
-              updateRequestLog(biasLogId, {
-                status: r.ok ? 'success' : 'error',
-                response: json || undefined,
-                error: r.ok ? undefined : 'Failed to classify opinions'
-              });
               if (!r.ok) throw new Error('Failed to classify opinions');
               return json;
             }).catch((e) => {
-              updateRequestLog(biasLogId, { status: 'error', error: String(e) });
               return null;
             })
           );
@@ -718,23 +536,24 @@ export default function Home() {
           : { url: '', content: '' };
         const fc = factCheckResultsLocal.find((r) => (r?.claim || '').toString().trim() === claimText.trim());
         // Normalize reference into either `reference` (string) or `Reference` (string[])
-        // Instead of using 'any', use the FactCheckResult interface
-        const refAny = (fc as FactCheckResult)?.reference ?? (fc as FactCheckResult)?.Reference;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const refAny = (fc as any)?.reference ?? (fc as any)?.Reference;
         const refString = typeof refAny === 'string' ? refAny : undefined;
-        const refArray = Array.isArray(refAny) ? (refAny as string[]) : undefined;
+        const refArray = Array.isArray(refAny) ? refAny as string[] : undefined;
 
         return {
           ...representative,
           relevantChunks: group.flatMap((g: SearchResult & { relevantChunks?: RelevantChunk[] }) => g.relevantChunks || []),
           factCheckSourceUrls: group.slice(0, 3).map((g: SearchResult) => g.url).filter(Boolean),
-          verdict: fc?.verdict || fc?.Verdict,
+          // Map the fact-check fields to the expected case
+          verdict: fc?.verdict || fc?.Verdict, // Try both cases
           reason: fc?.reason || fc?.Reason,
           ...(refString ? { reference: refString } : {}),
           ...(refArray ? { Reference: refArray } : {}),
-          trustScore: typeof fc?.trustScore === 'number' ? fc.trustScore :
-                      typeof fc?.Trust_Score === 'number' ? fc.Trust_Score :
-                      typeof fc?.trust_score === 'number' ? fc.trust_score : undefined,
-        };
+          trustScore: typeof fc?.trustScore === 'number' ? fc.trustScore : 
+                     typeof fc?.Trust_Score === 'number' ? fc.Trust_Score :
+                     typeof fc?.trust_score === 'number' ? fc.trust_score : undefined,
+        } as SearchResult;
       });
       
       // Add the average trust score to the first result
@@ -941,14 +760,6 @@ export default function Home() {
       const merged: SearchResult[] = groupedResults.map((group, index) => {
         const fc = (Array.isArray(factCheckResults) && (factCheckResults[index] ||
                   factCheckResults.find((r: { claim?: string }) => r?.claim === claimsData.claims?.[index]?.claim))) || undefined;
-        // Keep first group's result as representative and attach fc data
-        const representative: SearchResult = group.length > 0
-          ? group[0]
-          : { url: perClaimUrls[index]?.[0] || '', content: '' };
-        
-        // Debug log to see what we're getting
-        console.log(`Fact-check result for claim ${index}:`, fc);
-        
         // Normalize reference into either `reference` (string) or `Reference` (string[])
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const refAny = (fc as any)?.reference ?? (fc as any)?.Reference;
@@ -956,7 +767,7 @@ export default function Home() {
         const refArray = Array.isArray(refAny) ? refAny as string[] : undefined;
 
         return {
-          ...representative,
+          ...group[0],
           relevantChunks: group.flatMap((g: SearchResult & { relevantChunks?: RelevantChunk[] }) => g.relevantChunks || []),
           factCheckSourceUrls: group.slice(0, 3).map((g: SearchResult) => g.url).filter(Boolean),
           // Map the fact-check fields to the expected case
@@ -989,7 +800,7 @@ export default function Home() {
         if (!extractData) return null;
         return (
           <div className="bg-white border-2 border-black p-6 mt-6">
-            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+            <h3 className="text-lg text-gray-900 font-bold mb-4 flex items-center gap-2">
               <span>📄</span> Extracted Content
             </h3>
             <div className="space-y-4">
@@ -1027,7 +838,7 @@ export default function Home() {
         if (!reclaimifyData) return null;
         return (
           <div className="bg-white border-2 border-black p-6 mt-6">
-            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+            <h3 className="text-lg text-black font-bold mb-4 flex items-center gap-2">
               <span>🔍</span> Claimify Results
             </h3>
             <ReclaimifyResponseViewer data={reclaimifyData} />
@@ -1038,7 +849,7 @@ export default function Home() {
         if (!websearchData) return null;
         return (
           <div className="bg-white border-2 border-black p-6 mt-6">
-            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+            <h3 className="text-lg text-black font-bold mb-4 flex items-center gap-2">
               <span>🌐</span> Web Search Results
             </h3>
             <WebSearchViewer 
@@ -1053,12 +864,12 @@ export default function Home() {
         if (batchResults.length === 0) return null;
         return (
           <div className="bg-white border-2 border-black p-6 mt-6">
-            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+            <h3 className="text-lg text-black font-bold mb-4 flex items-center gap-2">
               <span>📦</span> Batch Analysis Results
             </h3>
             <div className="space-y-4">
               <div className="text-sm text-gray-600">
-                Extracted content from {batchResults.length} sources
+                Scraped data from {batchResults.length} sources
               </div>
               <div className="divide-y divide-gray-200 max-h-[500px] overflow-y-auto">
                 {batchResults.slice(0, 20).map((result, index) => (
@@ -1098,8 +909,8 @@ export default function Home() {
       case 'factcheck':
         return (
           <div className="bg-white border-2 border-black p-6 mt-6">
-            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
-              <span>✓</span> Fact Check Results
+            <h3 className="text-lg text-black font-bold mb-4 flex items-center gap-2">
+              <span>✅</span> Fact Check Results
             </h3>
             <FactCheckViewer 
               claims={websearchData?.claims || []}
@@ -1118,14 +929,14 @@ export default function Home() {
   const steps: { id: AnalysisStep; label: string; icon: string; isActive: boolean; isComplete: boolean }[] = [
     { 
       id: 'extract', 
-      label: 'Extract', 
+      label: 'Extract content', 
       icon: '📄', 
       isActive: loadingState.step1,
       isComplete: !!extractData
     },
     { 
       id: 'claimify', 
-      label: 'Claimify', 
+      label: 'Extract claims', 
       icon: '🔍', 
       isActive: loadingState.step1,
       isComplete: !!reclaimifyData
@@ -1139,7 +950,7 @@ export default function Home() {
     },
     { 
       id: 'batch', 
-      label: 'Batch', 
+      label: 'Scrape web', 
       icon: '📦', 
       isActive: loadingState.step3,
       isComplete: batchResults.length > 0
@@ -1147,7 +958,7 @@ export default function Home() {
     { 
       id: 'factcheck', 
       label: 'FactCheck', 
-      icon: '✓', 
+      icon: '✅', 
       isActive: loadingState.step4,
       isComplete: factCheckResults.length > 0
     },
@@ -1157,7 +968,7 @@ export default function Home() {
   const leftSidebar = (
     <div className="h-full flex flex-col">
       <div className="p-4 border-b border-gray-200">
-        <h2 className="font-bold text-lg">Analysis Steps</h2>
+        <h2 className="font-bold text-lg text-black">Analysis Steps</h2>
       </div>
       <div className="flex-1 overflow-y-auto">
         <div className="divide-y divide-gray-100">
@@ -1231,7 +1042,7 @@ export default function Home() {
             </div>
             <input
               type="text"
-              placeholder="Paste your link here..."
+              placeholder="Paste a link or text here..."
               className="w-full pl-10 pr-4 py-4 border-2 border-black rounded-none focus:outline-none focus:ring-0 focus:border-black transition-all duration-200 font-mono placeholder-gray-500 text-black bg-white"
               value={url}
               onChange={(e: React.ChangeEvent<HTMLInputElement>) => setUrl(e.target.value)}
@@ -1259,14 +1070,6 @@ export default function Home() {
         {(reclaimifyData || isAnalyzingClaims || loadingState.step5) && (
           <div className="mt-6">
             <div className="flex border-b border-gray-200 mb-4">
-              <button
-                className={`py-2 px-4 font-medium text-sm ${
-                  activeTab === 'analysis' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:text-gray-700'
-                }`}
-                onClick={() => setActiveTab('analysis')}
-              >
-                Claimify Analysis
-              </button>
               <button
                 className={`py-2 px-4 font-medium text-sm ${
                   activeTab === 'summary' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:text-gray-700'
@@ -1352,31 +1155,6 @@ export default function Home() {
     </div>
   );
 
-  // Right Sidebar Component
-  const rightSidebar = (
-    <div className="h-full flex flex-col">
-      <div className="p-4 border-b border-gray-200">
-        <h2 className="font-bold text-lg">Overview</h2>
-      </div>
-      <div className="p-4 border-b border-gray-200">
-        <div className="text-gray-800 text-sm">Avg. Trust Score</div>
-        <div className="text-3xl font-extrabold text-blue-700">
-          {typeof analysisState.avgTrustScore === 'number' ? analysisState.avgTrustScore.toFixed(2) : '0.00'}
-        </div>
-      </div>
-      <div className="flex-1 overflow-y-auto p-4">
-        <h3 className="font-medium text-gray-900 mb-2">Claims</h3>
-        <div className="space-y-2">
-          {claims ? (
-            <ClaimsList claims={claims} searchResults={claims?.searchResults} />
-          ) : (
-            <div className="text-sm text-gray-500">No claims yet. Analyze a URL to see claims.</div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col">
       {/* Header */}
@@ -1392,13 +1170,11 @@ export default function Home() {
         <ThreeColumnLayout 
           leftSidebar={leftSidebar}
           mainContent={mainContent}
-          rightSidebar={rightSidebar}
         />
       </main>
       
       {/* Global Components */}
       <InfoDialog />
-      <RequestProgressDialog activeRequests={activeRequests} />
       
       {/* Install Modal */}
       {showInstall && (

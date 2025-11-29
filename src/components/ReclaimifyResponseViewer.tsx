@@ -119,9 +119,7 @@ implicitClaims: sentence.implicitClaims,
         : []);
 
   return (
-    <div className={`bg-white p-6 border-2 border-black ${className}`}>
-      <h3 className="font-bold text-black mb-3">Claimify Analysis</h3>
-      
+    <div className={`bg-white p-6 border-2 border-black ${className}`}>      
       {/* Tabs */}
       <div className="flex border-b border-gray-200 mb-4">
         <button
@@ -139,14 +137,6 @@ implicitClaims: sentence.implicitClaims,
           onClick={() => setActiveTab('details')}
         >
           <span>Detailed Analysis</span>
-        </button>
-        <button
-          className={`py-2 px-4 font-medium text-sm flex items-center gap-1 ${
-            activeTab === 'raw' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:text-gray-700'
-          }`}
-          onClick={() => setActiveTab('raw')}
-        >
-          <span>Raw Data</span>
         </button>
       </div>
 
