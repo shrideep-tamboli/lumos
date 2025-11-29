@@ -35,6 +35,32 @@ type SupadataJobStatus = {
   error?: string;
 };
 
+// Supadata Metadata API types
+type SupadataMetadataResponse = {
+  platform: string;
+  type: string;
+  title: string | null;
+  description: string | null;
+  author: {
+    username: string | null;
+    displayName: string | null;
+    avatarUrl: string | null;
+  };
+  stats: {
+    views: number | null;
+    likes: number | null;
+    comments: number | null;
+    shares: number | null;
+  };
+  media: Array<{
+    type: string;
+    url: string;
+    thumbnail: string | null;
+  }>;
+  publishedAt: string | null;
+  url: string;
+};
+
 // --- Helper: Clean extracted text ---
 function cleanText(html: string): string {
   return html
@@ -122,23 +148,30 @@ async function pollSupadataJob(jobId: string, apiKey: string): Promise<SupadataT
 }
 
 /**
- * Extract transcript using Supadata for Instagram or X URLs
+ * Fetch metadata from Supadata (includes caption for Instagram/X posts)
  */
-async function extractSupadataTranscript(url: string): Promise<{
-  content: string;
-  title?: string;
-  excerpt?: string;
-  source: 'supadata-transcript';
-  availableLangs?: string[];
-}> {
-  const apiKey = process.env.SUPADATA_API_KEY;
-
-  if (!apiKey) {
-    throw new Error('Supadata API key is not configured. Please set SUPADATA_API_KEY.');
+async function fetchSupadataMetadata(url: string, apiKey: string): Promise<SupadataMetadataResponse | null> {
+  try {
+    const response = await axios.get<SupadataMetadataResponse>(`${SUPADATA_API_BASE_URL}/metadata`, {
+      params: { url },
+      headers: { 'x-api-key': apiKey },
+      timeout: 30000,
+    });
+    return response.data;
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 429) {
+      console.error('Supadata metadata API rate limit exceeded (429)');
+      throw new Error('Rate limit exceeded. Please try again in a few minutes.');
+    }
+    console.error('Error fetching Supadata metadata:', error);
+    return null;
   }
+}
 
-  let responseData: SupadataTranscriptResponse | SupadataJobResponse;
-
+/**
+ * Fetch transcript from Supadata (for videos/reels)
+ */
+async function fetchSupadataTranscript(url: string, apiKey: string): Promise<string | null> {
   try {
     const response = await axios.get<SupadataTranscriptResponse | SupadataJobResponse>(`${SUPADATA_API_BASE_URL}/transcript`, {
       params: {
@@ -146,49 +179,107 @@ async function extractSupadataTranscript(url: string): Promise<{
         text: true,
         mode: 'auto',
       },
-      headers: {
-        'x-api-key': apiKey,
-      },
+      headers: { 'x-api-key': apiKey },
       timeout: 60000,
     });
-    responseData = response.data;
+
+    let responseData = response.data;
+
+    // If we got a job ID, poll for the result
+    if ('jobId' in responseData && responseData.jobId) {
+      responseData = await pollSupadataJob(responseData.jobId, apiKey);
+    }
+
+    if (!('content' in responseData)) {
+      return null;
+    }
+
+    const finalResponse = responseData as SupadataTranscriptResponse;
+    const transcriptContent = typeof finalResponse.content === 'string'
+      ? finalResponse.content
+      : Array.isArray(finalResponse.content)
+        ? finalResponse.content.map((item: SupadataTranscriptChunk) => item.text).join(' ')
+        : null;
+
+    return transcriptContent?.trim() || null;
   } catch (error) {
-    console.error('Error calling Supadata transcript API:', error);
-    const message =
-      axios.isAxiosError(error) && error.response?.data
-        ? `Failed to fetch transcript from Supadata: ${JSON.stringify(error.response.data)}`
-        : 'Failed to fetch transcript from Supadata';
-    throw new Error(message);
+    if (axios.isAxiosError(error) && error.response?.status === 429) {
+      console.error('Supadata transcript API rate limit exceeded (429)');
+      // Don't throw here - let metadata still work if available
+    } else {
+      console.error('Error fetching Supadata transcript:', error);
+    }
+    return null;
+  }
+}
+
+/**
+ * Extract content using Supadata for Instagram or X URLs
+ * Combines metadata (caption) + transcript (for videos) for complete content
+ */
+async function extractSupadataContent(url: string): Promise<{
+  content: string;
+  title?: string;
+  excerpt?: string;
+  source: 'supadata' | 'supadata-transcript';
+  author?: string;
+  platform?: string;
+}> {
+  const apiKey = process.env.SUPADATA_API_KEY;
+
+  if (!apiKey) {
+    throw new Error('Supadata API key is not configured. Please set SUPADATA_API_KEY.');
   }
 
-  // If we got a job ID, poll for the result
-  if ('jobId' in responseData && responseData.jobId) {
-    responseData = await pollSupadataJob(responseData.jobId, apiKey);
+  // Fetch both metadata and transcript in parallel
+  const [metadata, transcript] = await Promise.all([
+    fetchSupadataMetadata(url, apiKey),
+    fetchSupadataTranscript(url, apiKey),
+  ]);
+
+  // Build content from available data
+  const contentParts: string[] = [];
+  let title = 'Social Media Post';
+  let excerpt = '';
+  let author = '';
+  let platform = '';
+
+  if (metadata) {
+    platform = metadata.platform || '';
+    author = metadata.author?.displayName || metadata.author?.username || '';
+    
+    // Caption is in title or description field
+    const caption = metadata.title || metadata.description || '';
+    if (caption) {
+      contentParts.push(`Caption: ${caption}`);
+      title = caption.substring(0, 100) + (caption.length > 100 ? '...' : '');
+      excerpt = caption.substring(0, 200);
+    }
+
+    if (author) {
+      excerpt = `@${metadata.author?.username || author}: ${excerpt}`;
+    }
   }
 
-  // At this point, responseData should be SupadataTranscriptResponse
-  // TypeScript needs help understanding this, so we check for content property
-  if (!('content' in responseData)) {
-    throw new Error('Supadata response did not include transcript content');
+  if (transcript) {
+    contentParts.push(`Transcript: ${transcript}`);
+    if (!excerpt) {
+      excerpt = `Video transcript: ${transcript.substring(0, 150)}...`;
+    }
   }
 
-  const finalResponse = responseData as SupadataTranscriptResponse;
-  const transcriptContent = typeof finalResponse.content === 'string'
-    ? finalResponse.content
-    : Array.isArray(finalResponse.content)
-      ? finalResponse.content.map((item: SupadataTranscriptChunk) => item.text).join(' ')
-      : null;
-
-  if (!transcriptContent) {
-    throw new Error('Supadata response did not include transcript content');
+  // If we have no content at all, throw error
+  if (contentParts.length === 0) {
+    throw new Error('Could not extract any content (caption or transcript) from this post. The post may be private or unavailable.');
   }
 
   return {
-    content: transcriptContent.trim(),
-    title: 'Supadata Transcript',
-    excerpt: `Transcript fetched via Supadata (${finalResponse.lang || 'unknown language'})`,
-    source: 'supadata-transcript',
-    availableLangs: finalResponse.availableLangs,
+    content: contentParts.join('\n\n'),
+    title,
+    excerpt,
+    source: metadata ? 'supadata' : 'supadata-transcript',
+    author,
+    platform,
   };
 }
 
@@ -369,7 +460,7 @@ export async function GET(request: Request) {
     if (isYouTubeUrl(url)) {
       extractedData = await extractYouTubeTranscript(url);
     } else if (isInstagramPostUrl(url) || isXPostUrl(url)) {
-      extractedData = await extractSupadataTranscript(url);
+      extractedData = await extractSupadataContent(url);
     } else {
       extractedData = await extractArticleText(url);
     }
@@ -408,7 +499,7 @@ export async function POST(request: Request) {
     if (isYouTubeUrl(url)) {
       extractedData = await extractYouTubeTranscript(url);
     } else if (isInstagramPostUrl(url) || isXPostUrl(url)) {
-      extractedData = await extractSupadataTranscript(url);
+      extractedData = await extractSupadataContent(url);
     } else {
       extractedData = await extractArticleText(url);
     }
