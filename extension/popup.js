@@ -1,6 +1,24 @@
-// Popup script for fact-checking interface
+// Popup script for fact-checking interface with backend integration
 
 document.getElementById("analyze").addEventListener("click", analyzePage);
+document.getElementById("reanalyze").addEventListener("click", () => {
+  // Clear cached result and re-analyze
+  chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+    const tab = tabs[0];
+    await chrome.storage.local.remove([`analysis_${tab.url}`]);
+    document.getElementById("resultsView").classList.add("hidden");
+    document.getElementById("initialState").classList.remove("hidden");
+    analyzePage();
+  });
+});
+
+// View logs link
+document.getElementById("logsLink").addEventListener("click", (e) => {
+  e.preventDefault();
+  // Open the extension's background page for logs
+  chrome.tabs.create({ url: 'chrome://extensions/?id=' + chrome.runtime.id });
+  alert('To view logs:\\n\\n1. Click "Details" on this extension\\n2. Click "Inspect views: service worker"\\n3. Go to Console tab\\n\\nOr press F12 on any page and check Console.');
+});
 
 // Check if page is already analyzed on load
 window.addEventListener('DOMContentLoaded', async () => {
@@ -15,14 +33,17 @@ window.addEventListener('DOMContentLoaded', async () => {
 async function analyzePage() {
   const analyzeBtn = document.getElementById("analyze");
   const status = document.getElementById("status");
-  const results = document.getElementById("results");
+  const statusText = document.getElementById("statusText");
+  const initialState = document.getElementById("initialState");
+  const resultsView = document.getElementById("resultsView");
   
   analyzeBtn.disabled = true;
   analyzeBtn.textContent = "Analyzing...";
   status.className = "status loading";
-  status.style.display = "block";
-  status.textContent = "Extracting content from page...";
-  results.classList.add("hidden");
+  status.style.display = "flex";
+  statusText.textContent = "Extracting content from page...";
+  
+  console.log("🔍 [Popup] Starting analysis...");
   
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -32,146 +53,109 @@ async function analyzePage() {
       throw new Error("Cannot analyze browser internal pages");
     }
     
-    // Inject content script if not already loaded
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ['readability.js']
-      });
-      
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ['content.js']
-      });
-    } catch (e) {
-      console.log("Content script already loaded or injection failed:", e);
-    }
+    console.log("🔍 [Popup] Analyzing URL:", tab.url);
+    statusText.textContent = "Sending to backend for analysis...";
     
-    // Small delay to ensure scripts are loaded
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
-    // Try to send message to content script
-    try {
-      await chrome.tabs.sendMessage(tab.id, { action: "analyze" });
-    } catch (msgError) {
-      // If message fails, analyze directly in popup
-      console.log("Using direct analysis method");
-      await analyzeDirectly(tab);
-      return;
-    }
-    
-    status.textContent = "Analyzing claims...";
-    
-    // Wait for background script to process
-    setTimeout(async () => {
-      const result = await chrome.storage.local.get([`analysis_${tab.url}`]);
-      if (result[`analysis_${tab.url}`]) {
-        displayResults(result[`analysis_${tab.url}`]);
-        status.style.display = "none";
-      } else {
-        throw new Error("Analysis timeout - please try again");
-      }
-      analyzeBtn.disabled = false;
-      analyzeBtn.textContent = "🔍 Analyze This Page";
-    }, 5000);
-    
-  } catch (error) {
-    console.error("Error:", error);
-    status.className = "status error";
-    status.textContent = `✗ ${error.message}`;
-    analyzeBtn.disabled = false;
-    analyzeBtn.textContent = "🔍 Analyze This Page";
-  }
-}
-
-// Fallback: analyze directly from popup without content script
-async function analyzeDirectly(tab) {
-  const status = document.getElementById("status");
-  const analyzeBtn = document.getElementById("analyze");
-  
-  try {
-    status.textContent = "Extracting text...";
-    
-    // Inject extraction script directly
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      function: extractPageText
-    });
-    
-    if (!results || !results[0] || !results[0].result) {
-      throw new Error("Could not extract page content");
-    }
-    
-    const pageText = results[0].result;
-    
-    status.textContent = "Analyzing content...";
-    
-    // Send to background for analysis
-    const data = {
-      text: pageText,
-      url: tab.url,
-      title: tab.title,
-      domain: new URL(tab.url).hostname,
-      tab: { id: tab.id }
-    };
-    
+    // Send analysis request to background script with URL
     chrome.runtime.sendMessage({
       action: "analyzeArticle",
-      data: data
+      data: {
+        url: tab.url,
+        title: tab.title,
+        domain: new URL(tab.url).hostname,
+        tab: { id: tab.id }
+      }
     });
     
-    // Wait for results
-    setTimeout(async () => {
+    // Wait for background script to process
+    statusText.textContent = "Analyzing claims and verifying facts...";
+    
+    // Poll for results with timeout
+    let pollCount = 0;
+    const maxPolls = 180; // 3 minutes max
+    
+    const progressMessages = [
+      "Extracting article content...",
+      "Identifying verifiable claims...",
+      "Searching for evidence...",
+      "Cross-referencing sources...",
+      "Fact-checking claims...",
+      "Calculating trust scores...",
+      "Finalizing analysis..."
+    ];
+    
+    const checkResults = async () => {
+      pollCount++;
+      
+      // Update progress message
+      const progressIndex = Math.min(Math.floor(pollCount / 20), progressMessages.length - 1);
+      statusText.textContent = progressMessages[progressIndex];
+      
+      console.log(`🔍 [Popup] Poll #${pollCount} - checking for results...`);
+      
       const result = await chrome.storage.local.get([`analysis_${tab.url}`]);
+      
       if (result[`analysis_${tab.url}`]) {
+        console.log('✅ [Popup] Found analysis result!');
         displayResults(result[`analysis_${tab.url}`]);
         status.style.display = "none";
+        analyzeBtn.disabled = false;
+        analyzeBtn.textContent = "🔍 Analyze This Page";
+      } else if (pollCount >= maxPolls) {
+        // Timeout after 3 minutes
+        throw new Error("Analysis timeout - please try again");
       } else {
-        throw new Error("Analysis failed");
+        setTimeout(checkResults, 1000); // Check every second
       }
-      analyzeBtn.disabled = false;
-      analyzeBtn.textContent = "🔍 Analyze This Page";
-    }, 3000);
+    };
+    
+    // Start checking after 2 seconds
+    setTimeout(checkResults, 2000);
     
   } catch (error) {
+    console.error("❌ [Popup] Error:", error);
     status.className = "status error";
-    status.textContent = `✗ ${error.message}`;
+    status.style.display = "block";
+    statusText.textContent = `✗ ${error.message}`;
     analyzeBtn.disabled = false;
     analyzeBtn.textContent = "🔍 Analyze This Page";
   }
-}
-
-// Function to extract page text (injected into page)
-function extractPageText() {
-  // Try multiple selectors for article content
-  const selectors = [
-    'article',
-    '[role="article"]',
-    '.article-content',
-    '.post-content',
-    '.entry-content',
-    'main',
-    '#content'
-  ];
-  
-  for (const selector of selectors) {
-    const element = document.querySelector(selector);
-    if (element && element.innerText.length > 200) {
-      return element.innerText;
-    }
-  }
-  
-  // Fallback to body
-  return document.body.innerText || document.body.textContent || "";
 }
 
 function displayResults(data) {
-  const results = document.getElementById("results");
+  const initialState = document.getElementById("initialState");
+  const resultsView = document.getElementById("resultsView");
   const scoreCircle = document.getElementById("scoreCircle");
   const scoreValue = document.getElementById("scoreValue");
   const scoreLabel = document.getElementById("scoreLabel");
   const claimsInfo = document.getElementById("claimsInfo");
   const claimsList = document.getElementById("claimsList");
+  const claimsCount = document.getElementById("claimsCount");
+  
+  // Hide initial state, show results
+  initialState.classList.add("hidden");
+  resultsView.classList.remove("hidden");
+  
+  console.log("📊 [Popup] Displaying results:", JSON.stringify(data, null, 2));
+  console.log("📊 [Popup] Claims array:", data.claims);
+  console.log("📊 [Popup] Claims count:", data.claims?.length);
+  
+  // Check if there's an error or no claims
+  if (data.error) {
+    scoreCircle.className = "score-circle low";
+    scoreValue.textContent = "⚠️";
+    scoreLabel.textContent = data.error;
+    claimsInfo.textContent = "Unable to verify content";
+    claimsCount.textContent = "0";
+    claimsList.innerHTML = `
+      <div class="empty-claims">
+        <div class="icon">⚠️</div>
+        <div style="font-weight:600;margin-bottom:8px;">${data.error}</div>
+        <div style="font-size:12px;color:#888;">This article may not contain factual claims that can be verified, or the content could not be extracted properly.</div>
+      </div>
+    `;
+    return;
+  }
   
   const score = data.overall_score || 0;
   const scorePercent = Math.round(score * 100);
@@ -180,7 +164,7 @@ function displayResults(data) {
   scoreCircle.className = "score-circle";
   if (scorePercent > 70) {
     scoreCircle.classList.add("high");
-    scoreLabel.textContent = data.verdict || "✅ Trustworthy";
+    scoreLabel.textContent = data.verdict || "✅ Highly Trustworthy";
   } else if (scorePercent > 40) {
     scoreCircle.classList.add("medium");
     scoreLabel.textContent = data.verdict || "⚠️ Mixed Credibility";
@@ -189,39 +173,90 @@ function displayResults(data) {
     scoreLabel.textContent = data.verdict || "❌ Low Credibility";
   }
   
-  const claimsCount = data.claims?.length || 0;
+  // Get claims array - handle different possible structures
+  let claims = [];
+  if (Array.isArray(data.claims)) {
+    claims = data.claims;
+  } else if (data.claims && typeof data.claims === 'object') {
+    // Maybe it's an object with claims inside
+    claims = Object.values(data.claims);
+  }
+  
+  console.log("📊 [Popup] Processed claims:", claims);
+  
+  const totalClaims = claims.length;
   const category = data.category || "general";
-  const credible = data.claims?.filter(c => c.score >= 0.7).length || 0;
-  const questionable = data.claims?.filter(c => c.score >= 0.4 && c.score < 0.7).length || 0;
-  const suspicious = data.claims?.filter(c => c.score < 0.4).length || 0;
+  const credible = claims.filter(c => (c.score || 0) >= 0.7).length;
+  const questionable = claims.filter(c => (c.score || 0) >= 0.4 && (c.score || 0) < 0.7).length;
+  const suspicious = claims.filter(c => (c.score || 0) < 0.4).length;
   
-  claimsInfo.textContent = `${claimsCount} claims • ${category} • ✅${credible} ⚠️${questionable} ❌${suspicious}`;
+  claimsInfo.innerHTML = `
+    <div>${category.charAt(0).toUpperCase() + category.slice(1)} content</div>
+    <div style="margin-top:4px;">✅ ${credible} &nbsp; ⚠️ ${questionable} &nbsp; ❌ ${suspicious}</div>
+  `;
+  claimsCount.textContent = totalClaims;
   
+  // Clear and populate claims list
   claimsList.innerHTML = "";
-  if (data.claims && data.claims.length > 0) {
-    data.claims.forEach((claim, index) => {
+  
+  if (claims.length > 0) {
+    console.log("📊 [Popup] Rendering", claims.length, "claims");
+    
+    claims.forEach((claim, index) => {
+      console.log(`📊 [Popup] Claim ${index}:`, claim);
+      
       const claimDiv = document.createElement("div");
       claimDiv.className = "claim-item";
-      const claimScore = claim.score || 0;
-      if (claimScore > 0.7) claimDiv.classList.add("true");
-      else if (claimScore > 0.4) claimDiv.classList.add("mixed");
+      
+      // Handle different score field names
+      const claimScore = claim.score || claim.trust_score || claim.trustScore || 0;
+      const normalizedScore = claimScore > 1 ? claimScore / 100 : claimScore;
+      
+      if (normalizedScore >= 0.7) claimDiv.classList.add("true");
+      else if (normalizedScore >= 0.4) claimDiv.classList.add("mixed");
       else claimDiv.classList.add("false");
       
-      let details = `${Math.round(claimScore * 100)}% - ${claim.verification_status || 'Unknown'}`;
-      if (claim.trust_level) details += ` • ${claim.trust_level} source`;
-      if (claim.types && claim.types.length > 0) details += ` • ${claim.types[0]}`;
+      // Get the raw trust score (0-100) from the claim data
+      const rawTrustScore = claim.raw_trust_score || claim.trustScore || claim.trust_score || Math.round(normalizedScore * 100);
+      
+      // Determine badge type
+      let badgeClass = 'unclear';
+      let badgeText = 'Unclear';
+      if (normalizedScore >= 0.7) {
+        badgeClass = 'verified';
+        badgeText = 'Verified';
+      } else if (normalizedScore < 0.4) {
+        badgeClass = 'disputed';
+        badgeText = 'Disputed';
+      }
+      
+      // Get claim text - handle different field names
+      const claimText = claim.text || claim.claim || claim.content || 'Unknown claim';
+      const verificationStatus = claim.verification_status || claim.verdict || claim.status || '';
+      const reasoning = claim.reasoning || claim.reference || claim.explanation || '';
       
       claimDiv.innerHTML = `
-        <div class="claim-text">${escapeHtml(claim.text)}</div>
-        <div class="claim-score">${details}</div>
-        ${claim.reasoning ? `<div style="font-size:10px;color:#888;margin-top:4px;font-style:italic;">${escapeHtml(claim.reasoning.substring(0, 120))}${claim.reasoning.length > 120 ? '...' : ''}</div>` : ''}
+        <div class="claim-text">${escapeHtml(claimText)}</div>
+        <div class="claim-score">
+          <span class="claim-badge ${badgeClass}">${badgeText}</span>
+          <span>Score: ${rawTrustScore}%</span>
+          ${verificationStatus ? `<span>• ${verificationStatus}</span>` : ''}
+        </div>
+        ${reasoning ? `<div class="claim-reasoning">${escapeHtml(String(reasoning).substring(0, 150))}${String(reasoning).length > 150 ? '...' : ''}</div>` : ''}
       `;
       claimsList.appendChild(claimDiv);
     });
+    
+    console.log("📊 [Popup] Claims list innerHTML length:", claimsList.innerHTML.length);
   } else {
-    claimsList.innerHTML = '<div style="text-align:center;color:#999;padding:20px;">No claims detected</div>';
+    console.log("📊 [Popup] No claims to display");
+    claimsList.innerHTML = `
+      <div class="empty-claims">
+        <div class="icon">📭</div>
+        <div>No claims detected</div>
+      </div>
+    `;
   }
-  results.classList.remove("hidden");
 }
 
 function escapeHtml(text) {
