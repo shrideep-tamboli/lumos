@@ -12,18 +12,46 @@ interface RelevantChunk {
   similarity: number;
 }
 
-interface ProcessingMetrics {
-  totalClaims: number;
-  successfulSearches: number;
-  failedSearches: number;
-  successfulExtractions: number;
-  failedExtractions: number;
-  errors: Array<{
-    claim: string;
-    stage: 'search' | 'extraction';
-    error: string;
-  }>;
+// Types for the batch analysis response
+interface BatchAnalysisResult {
+  claim?: string;
+  url?: string;
+  content?: string;
+  title?: string;
+  excerpt?: string;
+  error?: string;
+  relevantChunks?: RelevantChunk[];
 }
+
+// Type guard for BatchAnalysisResult
+const isBatchAnalysisResult = (data: unknown): data is BatchAnalysisResult => {
+  return (
+    typeof data === 'object' && 
+    data !== null && 
+    (data as BatchAnalysisResult).claim !== undefined
+  );
+};
+
+// Type for the web search response
+interface WebSearchResponse {
+  urls: string[][];
+  metrics?: {
+    totalSearches: number;
+    successfulSearches: number;
+    failedSearches: number;
+    sources: Record<string, number>;
+    errors: Array<{ claim: string; stage: string; source: string; error: string }>;
+  };
+}
+
+// Type guard for WebSearchResponse
+const isWebSearchResponse = (data: unknown): data is WebSearchResponse => {
+  return (
+    typeof data === 'object' && 
+    data !== null && 
+    Array.isArray((data as WebSearchResponse).urls)
+  );
+};
 
 interface AnalysisState {
   totalClaims?: number;
@@ -36,6 +64,12 @@ interface AnalysisState {
     refute: number;
   };
   avgTrustScore?: number;
+  bias?: {
+    positivePercent: number;
+    negativePercent: number;
+    otherPercent: number;
+    total: number;
+  };
 }
 
 interface LoadingState {
@@ -49,17 +83,16 @@ interface LoadingState {
 export default function Home() {
   const [url, setUrl] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [isAnalyzingClaims, setIsAnalyzingClaims] = useState(false);
-  const [mode, setMode] = useState<'analyze' | 'claimify' | 'reclaimify'>('analyze');
+  const [isAnalyzingClaims] = useState(false);
+  const [mode] = useState<'analyze' | 'claimify' | 'reclaimify'>('analyze');
   const [activeTab, setActiveTab] = useState<'analysis' | 'summary'>('analysis');
-  // prefix unused state names with _ or rename to avoid linter warnings
-  const [_result, setResult] = useState<{ url: string; content: string } | null>(null);
+  const [, setResult] = useState<{ url: string; content: string } | null>(null);
+
   const [claims, setClaims] = useState<ClaimsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showInstall, setShowInstall] = useState(false);
   const [reclaimifyData, setReclaimifyData] = useState<ReclaimifyApiResponse | null>(null);
-  
-  // State for progressive loading
+
   const [analysisState, setAnalysisState] = useState<AnalysisState>({
     totalClaims: 0,
     analyzedCount: 0,
@@ -79,291 +112,386 @@ export default function Home() {
     step4: false,
     step5: false,
   });
-  
-  // State for claims panel
+
   const [showClaimsPanel, setShowClaimsPanel] = useState(false);
 
   const handleAnalyze = async () => {
-  if (!url.trim()) {
-    setError('Please enter a URL');
-    return;
-  }
-  
-  setIsLoading(true);
-  setError(null);
-  setResult(null);
-  setClaims(null);
-  setReclaimifyData(null);
-  setLoadingState({
-    step1: true,  // Starting step 1
-    step2: false,
-    step3: false,
-    step4: false,
-    step5: false
-  });
-  setShowClaimsPanel(false);
-  
-  try {
-    // 1. Extract text from URL (handles both regular URLs and YouTube URLs)
-    setLoadingState(prev => ({ ...prev, step1: true }));
-    const extractResponse = await fetch(`/api/extract?url=${encodeURIComponent(url.trim())}`);
-    
-    if (!extractResponse.ok) {
-      const errorData = await extractResponse.json().catch(() => ({}));
-      throw new Error(errorData.error || 'Failed to extract content from URL');
-    }
-    
-    const extractData = await extractResponse.json();
-    
-    // 2. Send extracted content to reclaimify for processing (works for both regular URLs and YouTube URLs)
-    const reclaimifyResponse = await fetch('/api/reclaimify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url: extractData.url || url.trim(),
-        content: extractData.content,
-        title: extractData.title,
-        excerpt: extractData.excerpt
-      })
-    });
-    
-    if (!reclaimifyResponse.ok) {
-      const errorData = await reclaimifyResponse.json().catch(() => ({}));
-      throw new Error(errorData.error || 'Failed to process content');
-    }
-    
-    const reclaimifyData: ReclaimifyApiResponse = await reclaimifyResponse.json();
-    setReclaimifyData(reclaimifyData);
-    setResult({ url: reclaimifyData.url || url.trim(), content: reclaimifyData.content || '' });
-    setActiveTab('summary'); // Switch to Analysis Summary tab after getting reclaimify data
-
-    // 3. Build verifiable claims from new API shape first, fallback to old
-    const verifiableFromArray = Array.isArray(reclaimifyData.verifiableClaims)
-      ? reclaimifyData.verifiableClaims.filter((s) => typeof s === 'string' && s.trim().length > 0)
-      : [];
-
-    interface ProcessedSentence {
-      finalClaim?: string;
-      // Add other properties if they exist in the processed sentences
-    }
-
-    const processedSentences = reclaimifyData.processedSentences as (ProcessedSentence & {
-      implicitClaims?: Array<string | { claim: string }>;
-    })[] | undefined;
-    const verifiableFromProcessed = Array.isArray(processedSentences)
-      ? processedSentences
-          .flatMap((p) => {
-            const implicit = Array.isArray(p?.implicitClaims)
-              ? p!.implicitClaims!
-                  .map((c) => (typeof c === 'string' ? c : c.claim))
-                  .map((s) => (s ?? '').toString().trim())
-                  .filter((s) => s.length > 0)
-              : [];
-            if (implicit.length > 0) return implicit;
-            const fc = (p?.finalClaim ?? '').toString().trim();
-            return fc ? [fc] : [];
-          })
-          .filter((s) => s.length > 0)
-      : [];
-
-    const categorized = Array.isArray(reclaimifyData.categorizedSentences)
-      ? reclaimifyData.categorizedSentences
-      : [];
-    const verifiableFromCategorized = categorized
-      .filter((item) => item.category === 'Verifiable')
-      .map((item) => item.sentence);
-
-    const verifiableList: string[] = verifiableFromArray.length > 0
-      ? verifiableFromArray
-      : (verifiableFromProcessed.length > 0
-          ? verifiableFromProcessed
-          : verifiableFromCategorized);
-
-    if (!verifiableList.length) {
-      setLoadingState(prev => ({ ...prev, step1: false }));
-      setError('No verifiable claims found from the article.');
+    if (!url.trim()) {
+      setError('Please enter a URL');
       return;
     }
 
-    const searchDate = new Date().toISOString().split('T')[0];
-    const claimsData = {
-      claims: verifiableList.map((claim: string) => ({ claim, search_date: searchDate })),
-      search_date: searchDate,
-    };
-
-    setAnalysisState(prev => ({
-      ...prev,
-      totalClaims: claimsData.claims.length
-    }));
-
-    // 4. Call websearch
-    setLoadingState(prev => ({ ...prev, step1: false, step2: true }));
-    const webSearchResponse = await fetch('/api/websearch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        claims: claimsData.claims,
-        search_date: searchDate,
-        originalUrl: url.trim()
-      })
+    setIsLoading(true);
+    setError(null);
+    setResult(null);
+    setClaims(null);
+    setReclaimifyData(null);
+    setLoadingState({
+      step1: true,  // Starting step 1
+      step2: false,
+      step3: false,
+      step4: false,
+      step5: false
     });
+    setShowClaimsPanel(false);
 
-    if (!webSearchResponse.ok) {
-      throw new Error('Failed to perform web search');
-    }
-    
-    const webSearchData = await webSearchResponse.json();
-    const urlsPerClaim: string[][] = Array.isArray(webSearchData?.urls) ? webSearchData.urls : [];
-    
-    // Flatten URLs for batch extraction and create claim mapping
-    const flattenedUrls: string[] = [];
-    const claimsOnePerUrl: string[] = [];
-    
-    urlsPerClaim.forEach((urls, claimIndex) => {
-      urls.forEach(url => {
-        if (url) {
-          flattenedUrls.push(url);
-          claimsOnePerUrl.push(claimsData.claims[claimIndex]?.claim || '');
-        }
-      });
-    });
-
-    // 5. Call batch analysis with URLs and claims
-    setLoadingState(prev => ({ ...prev, step2: false, step3: true }));
-    
-    if (flattenedUrls.length === 0) {
-      throw new Error('No valid URLs found for analysis');
-    }
-    
-    const batchResponse = await fetch('/api/analyze/batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        urls: flattenedUrls,
-        claims: claimsOnePerUrl
-      })
-    });
-
-    if (!batchResponse.ok) {
-      throw new Error('Failed to analyze content');
-    }
-
-    const batchData = await batchResponse.json();
-    const batchResults: Array<{ claim?: string; url?: string; content?: string; title?: string; excerpt?: string; error?: string; relevantChunks?: RelevantChunk[] }> = Array.isArray(batchData?.results) ? batchData.results : [];
-
-    // Group extracted contents per claim for fact checking
-    const contentsByClaim: Record<string, string[]> = {};
-    
-    batchResults.forEach((result) => {
-      const claimKey = (result?.claim || '').toString().trim();
-      const content = (result?.content || '').toString().trim();
+    try {
+      // 1. Extract text from URL (handles both regular URLs and YouTube URLs)
+      setLoadingState(prev => ({ ...prev, step1: true }));
+      const extractResponse = await fetch(`/api/extract?url=${encodeURIComponent(url.trim())}`);
       
-      if (claimKey && content) {
-        if (!contentsByClaim[claimKey]) {
-          contentsByClaim[claimKey] = [];
-        }
-        contentsByClaim[claimKey].push(content);
+      if (!extractResponse.ok) {
+        const errorData = await extractResponse.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Failed to extract content from URL');
       }
-    });
-
-    // 6. Call fact check with claims and their associated content
-    setLoadingState(prev => ({ ...prev, step3: false, step4: true }));
-    
-    const factCheckClaims = Object.entries(contentsByClaim).map(([claim, content]) => ({
-      claim,
-      content: content.length === 1 ? content[0] : content
-    }));
-
-    let factCheckResults: FactCheckResult[] = [];
-    let averageTrustScore: number | undefined = undefined;
-    
-    if (factCheckClaims.length > 0) {
-      const factCheckResponse = await fetch('/api/factCheck', {
+      
+      const extractData = await extractResponse.json();
+      
+      // 2. Send extracted content to reclaimify for processing (works for both regular URLs and YouTube URLs)
+      const reclaimifyResponse = await fetch('/api/reclaimify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          claims: factCheckClaims
+          url: extractData.url || url.trim(),
+          content: extractData.content,
+          title: extractData.title,
+          excerpt: extractData.excerpt
+        })
+      });
+      
+      if (!reclaimifyResponse.ok) {
+        const errorData = await reclaimifyResponse.json().catch(() => ({}));
+        throw new Error(errorData.error || 'Failed to process content');
+      }
+      
+      const reclaimifyData: ReclaimifyApiResponse = await reclaimifyResponse.json();
+      setReclaimifyData(reclaimifyData);
+      setResult({ url: reclaimifyData.url || url.trim(), content: reclaimifyData.content || '' });
+      setActiveTab('summary'); // Switch to Analysis Summary tab after getting reclaimify data
+
+      // 3. Build verifiable claims from new API shape first, fallback to old
+      const verifiableFromArray = Array.isArray(reclaimifyData.verifiableClaims)
+        ? reclaimifyData.verifiableClaims.filter((s) => typeof s === 'string' && s.trim().length > 0)
+        : [];
+
+      interface ProcessedSentence {
+        category: string;
+        originalSentence: string;
+        // Add other properties if they exist
+        [key: string]: unknown;
+      }
+
+      const processedSentences = reclaimifyData.processedSentences as (ProcessedSentence & {
+        implicitClaims?: Array<string | { claim: string }>;
+      })[] | undefined;
+      const verifiableFromProcessed = Array.isArray(processedSentences)
+        ? processedSentences
+            .flatMap((p) => {
+              const implicit = Array.isArray(p?.implicitClaims)
+                ? p!.implicitClaims!
+                    .map((c) => (typeof c === 'string' ? c : c.claim))
+                    .map((s) => (s ?? '').toString().trim())
+                    .filter((s) => s.length > 0)
+                : [];
+              if (implicit.length > 0) return implicit;
+              const fc = (p?.finalClaim ?? '').toString().trim();
+              return fc ? [fc] : [];
+            })
+            .filter((s) => s.length > 0)
+        : [];
+
+      const categorized = Array.isArray(reclaimifyData.categorizedSentences)
+        ? reclaimifyData.categorizedSentences
+        : [];
+      const verifiableFromCategorized = categorized
+        .filter((item) => item.category === 'Verifiable')
+        .map((item) => item.sentence);
+
+      const verifiableList: string[] = verifiableFromArray.length > 0
+        ? verifiableFromArray
+        : (verifiableFromProcessed.length > 0
+            ? verifiableFromProcessed
+            : verifiableFromCategorized);
+
+      if (!verifiableList.length) {
+        setLoadingState(prev => ({ ...prev, step1: false }));
+        setError('No verifiable claims found from the article.');
+        return;
+      }
+
+      // Collect Not Verifiable sentences for bias analysis
+      const notVerifiableItems: string[] = Array.isArray(reclaimifyData.processedSentences)
+        ? (reclaimifyData.processedSentences as ProcessedSentence[])
+            .filter((s): s is ProcessedSentence & { originalSentence: string } => 
+              s?.category === 'Not Verifiable' && 
+              typeof s?.originalSentence === 'string' && 
+              s.originalSentence.trim().length > 0
+            )
+            .map((s) => s.originalSentence.trim())
+        : [];
+
+      const searchDate = new Date().toISOString().split('T')[0];
+      const claimsData = {
+        claims: verifiableList.map((claim: string) => ({ claim, search_date: searchDate })),
+        search_date: searchDate,
+      };
+
+      setAnalysisState(prev => ({
+        ...prev,
+        totalClaims: claimsData.claims.length
+      }));
+
+      // 4. Call websearch
+      setLoadingState(prev => ({ ...prev, step1: false, step2: true }));
+      const webSearchResponse = await fetch('/api/websearch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          claims: claimsData.claims,
+          search_date: searchDate,
+          originalUrl: url.trim()
         })
       });
 
-      if (!factCheckResponse.ok) {
-        throw new Error('Failed to perform fact checking');
+      if (!webSearchResponse.ok) {
+        throw new Error('Failed to perform web search');
       }
       
-      const fcJson = await factCheckResponse.json();
-      factCheckResults = Array.isArray(fcJson?.results) ? fcJson.results : [];
-      averageTrustScore = typeof fcJson?.averageTrustScore === 'number' ? fcJson.averageTrustScore : undefined;
-    }
-
-    // Merge fact-check results with batch extraction results per claim
-    const groupedByClaim: Record<string, SearchResult[]> = {};
-    batchResults.forEach((r) => {
-      const k = (r?.claim || '').toString().trim();
-      if (!k) return;
-      if (!groupedByClaim[k]) groupedByClaim[k] = [];
-      groupedByClaim[k].push({
-        url: String(r?.url || ''),
-        content: String(r?.content || ''),
-        title: r?.title || undefined,
-        excerpt: r?.excerpt || undefined,
-        error: r?.error || undefined,
-        relevantChunks: Array.isArray(r?.relevantChunks) ? r.relevantChunks : []
+      const webSearchData = await webSearchResponse.json() as WebSearchResponse;
+      
+      if (!isWebSearchResponse(webSearchData)) {
+        throw new Error('Invalid web search response format');
+      }
+      
+      const urlsPerClaim: string[][] = webSearchData.urls || [];
+      
+      // Flatten URLs for batch extraction and create claim mapping
+      const flattenedUrls: string[] = [];
+      const claimsOnePerUrl: string[] = [];
+      
+      urlsPerClaim.forEach((urls, claimIndex) => {
+        urls.forEach(url => {
+          if (typeof url === 'string' && url.trim() !== '') {
+            flattenedUrls.push(url.trim());
+            const claim = claimsData.claims[claimIndex]?.claim;
+            claimsOnePerUrl.push(claim || '');
+          }
+        });
       });
-    });
 
-    const mergedResults: SearchResult[] = claimsData.claims.map((c: { claim: string }, index: number) => {
-      const claimText = c.claim;
-      const group = groupedByClaim[claimText] || [];
-      const representative: SearchResult = group.length > 0
-        ? group[0]
-        : { url: '', content: '' };
-      const fc = factCheckResults.find((r) => (r?.claim || '').toString().trim() === claimText.trim());
-      return {
-        ...representative,
-        verdict: fc?.verdict || fc?.Verdict,
-        reason: fc?.reason || fc?.Reason,
-        reference: fc?.reference || fc?.Reference,
-        trustScore: typeof fc?.trustScore === 'number' ? fc.trustScore :
-                    typeof fc?.Trust_Score === 'number' ? fc.Trust_Score :
-                    typeof fc?.trust_score === 'number' ? fc.trust_score : undefined,
-      } as SearchResult;
-    });
+      // 5. Call batch analysis with URLs and claims
+      setLoadingState(prev => ({ ...prev, step2: false, step3: true }));
+      
+      if (flattenedUrls.length === 0) {
+        throw new Error('No valid URLs found for analysis');
+      }
+      
+      const batchResponse = await fetch('/api/analyze/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          urls: flattenedUrls,
+          claims: claimsOnePerUrl
+        })
+      });
 
-    // Update analysis summary metrics
-    const verdictCounts = { support: 0, partially: 0, unclear: 0, contradict: 0, refute: 0 };
-    for (const fc of factCheckResults) {
-      const v = (fc?.verdict || fc?.Verdict || '').toString();
-      if (v === 'Support') verdictCounts.support++;
-      else if (v === 'Partially Support') verdictCounts.partially++;
-      else if (v === 'Unclear') verdictCounts.unclear++;
-      else if (v === 'Contradict') verdictCounts.contradict++;
-      else if (v === 'Refute') verdictCounts.refute++;
+      if (!batchResponse.ok) {
+        const errorData = await batchResponse.text();
+        console.error('Batch analysis failed:', errorData);
+        throw new Error('Failed to analyze content');
+      }
+
+      const batchData = await batchResponse.json();
+      const batchResults: BatchAnalysisResult[] = Array.isArray(batchData?.results) 
+        ? batchData.results.filter(isBatchAnalysisResult) 
+        : [];
+
+      // Group extracted contents per claim for fact checking
+      const contentsByClaim: Record<string, string[]> = {};
+      
+      batchResults.forEach((result) => {
+        const claimKey = (result?.claim || '').toString().trim();
+        const content = (result?.content || '').toString().trim();
+        
+        if (claimKey && content) {
+          if (!contentsByClaim[claimKey]) {
+            contentsByClaim[claimKey] = [];
+          }
+          contentsByClaim[claimKey].push(content);
+        }
+      });
+
+      // 6. Call fact check with claims and their associated content
+      setLoadingState(prev => ({ ...prev, step3: false, step4: true }));
+
+      let factCheckResults: FactCheckResult[] = [];
+      let averageTrustScore: number | undefined = undefined;
+      let biasPercentages: { positive?: number; negative?: number; other?: number; total?: number } | undefined = undefined;
+      const factCheckClaims = Object.entries(contentsByClaim).map(([claim, content]) => ({
+            claim,
+            content: content.length === 1 ? content[0] : content
+          }));
+      if (factCheckClaims.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const requests: Array<Promise<any>> = [];
+        
+        // Create a promise for each claim's fact check
+        const factCheckPromises = factCheckClaims.map(claimData => 
+          fetch('/api/factCheck', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ claims: [claimData] }) // Send one claim at a time
+          })
+          .then(async (r) => {
+            if (!r.ok) {
+              console.error('Failed to perform fact checking for claim:', claimData.claim);
+              return null;
+            }
+            return r.json();
+          })
+          .catch(error => {
+            console.error('Error in fact check request:', error);
+            return null;
+          })
+        );
+
+        // Bias request (only if we have items)
+        if (notVerifiableItems.length > 0) {
+          requests.push(
+            fetch('/api/bias', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ items: notVerifiableItems })
+            }).then(async (r) => {
+              if (!r.ok) throw new Error('Failed to classify opinions');
+              return r.json();
+            }).catch(() => null)
+          );
+        }
+
+        // Process fact check results
+        const factCheckResponses = await Promise.all(factCheckPromises);
+        factCheckResults = factCheckResponses
+          .filter(response => response?.results?.length > 0)
+          .flatMap(response => response.results);
+
+        // Calculate average trust score from successful responses
+        const validScores = factCheckResults
+          .filter(r => typeof r.trustScore === 'number' || typeof r.Trust_Score === 'number')
+          .map(r => (r.trustScore ?? r.Trust_Score) as number); // Type assertion to ensure number[]
+
+        if (validScores.length > 0) {
+          averageTrustScore = validScores.reduce((sum, score) => sum + score, 0) / validScores.length;
+        }
+
+        // Process bias results if any
+        if (requests.length > 0) {
+          const biasResponse = await Promise.all(requests);
+          const biasJson = biasResponse[0];
+          if (biasJson && typeof biasJson === 'object' && biasJson.percentages) {
+            biasPercentages = {
+              positive: Number(biasJson.percentages.positive) || 0,
+              negative: Number(biasJson.percentages.negative) || 0,
+              other: Number(biasJson.percentages.other) || 0,
+              total: Array.isArray(biasJson.results) ? biasJson.results.length : (notVerifiableItems.length || 0),
+            };
+          }
+        } else if (notVerifiableItems.length === 0) {
+          biasPercentages = { positive: 0, negative: 0, other: 0, total: 0 };
+        }
+      }
+
+      // Merge fact-check results with batch extraction results per claim
+      const groupedByClaim: Record<string, SearchResult[]> = {};
+      batchResults.forEach((r) => {
+        const k = (r?.claim || '').toString().trim();
+        if (!k) return;
+        if (!groupedByClaim[k]) groupedByClaim[k] = [];
+        groupedByClaim[k].push({
+          url: String(r?.url || ''),
+          content: String(r?.content || ''),
+          title: r?.title || undefined,
+          excerpt: r?.excerpt || undefined,
+          error: r?.error || undefined,
+          relevantChunks: Array.isArray(r?.relevantChunks) ? r.relevantChunks as RelevantChunk[] : [],
+        });
+      });
+
+      const mergedResults: SearchResult[] = claimsData.claims.map((c) => {
+        const claimText = c.claim;
+        const group = groupedByClaim[claimText] || [];
+        const representative: SearchResult = group.length > 0
+          ? group[0]
+          : { url: '', content: '' };
+        const fc = factCheckResults.find((r) => (r?.claim || '').toString().trim() === claimText.trim());
+        // Normalize reference into either `reference` (string) or `Reference` (string[])
+        // Instead of using 'any', use the FactCheckResult interface
+        const refAny = (fc as FactCheckResult)?.reference ?? (fc as FactCheckResult)?.Reference;
+        const refString = typeof refAny === 'string' ? refAny : undefined;
+        const refArray = Array.isArray(refAny) ? (refAny as string[]) : undefined;
+
+        return {
+          ...representative,
+          relevantChunks: group.flatMap((g: SearchResult & { relevantChunks?: RelevantChunk[] }) => g.relevantChunks || []),
+          factCheckSourceUrls: group.slice(0, 3).map((g: SearchResult) => g.url).filter(Boolean),
+          verdict: fc?.verdict || fc?.Verdict,
+          reason: fc?.reason || fc?.Reason,
+          ...(refString ? { reference: refString } : {}),
+          ...(refArray ? { Reference: refArray } : {}),
+          trustScore: typeof fc?.trustScore === 'number' ? fc.trustScore :
+                      typeof fc?.Trust_Score === 'number' ? fc.Trust_Score :
+                      typeof fc?.trust_score === 'number' ? fc.trust_score : undefined,
+        };
+      });
+      
+      // Add the average trust score to the first result
+      if (mergedResults.length > 0) {
+        mergedResults[0].aggregateTrustScore = averageTrustScore;
+      }
+
+      // Update analysis summary metrics
+      const verdictCounts = { support: 0, partially: 0, unclear: 0, contradict: 0, refute: 0 };
+      for (const fc of factCheckResults) {
+        const v = (fc?.verdict || fc?.Verdict || '').toString();
+        if (v === 'Support') verdictCounts.support++;
+        else if (v === 'Partially Support') verdictCounts.partially++;
+        else if (v === 'Unclear') verdictCounts.unclear++;
+        else if (v === 'Contradict') verdictCounts.contradict++;
+        else if (v === 'Refute') verdictCounts.refute++;
+      }
+      setAnalysisState((prev: AnalysisState) => ({
+        ...prev,
+        analyzedCount: mergedResults.length,
+        verdicts: verdictCounts,
+        avgTrustScore: typeof averageTrustScore === 'number' ? averageTrustScore : prev.avgTrustScore,
+        bias: biasPercentages
+          ? {
+              positivePercent: biasPercentages.positive ?? 0,
+              negativePercent: biasPercentages.negative ?? 0,
+              otherPercent: biasPercentages.other ?? 0,
+              total: biasPercentages.total ?? 0,
+            }
+          : prev.bias,
+      }));
+
+      // Update final state with merged results so ClaimsList can render
+      setClaims({
+        ...claimsData,
+        searchResults: mergedResults,
+        analysis: batchData,
+        factChecks: factCheckResults
+      });
+      
+      setShowClaimsPanel(true);
+      setLoadingState(prev => ({ ...prev, step4: false, step5: true }));
+
+    } catch (error) {
+      console.error('Error:', error);
+      setError(error instanceof Error ? error.message : 'An unknown error occurred');
+    } finally {
+      setIsLoading(false);
     }
-    setAnalysisState((prev: AnalysisState) => ({
-      ...prev,
-      analyzedCount: mergedResults.length,
-      verdicts: verdictCounts,
-      avgTrustScore: typeof averageTrustScore === 'number' ? averageTrustScore : prev.avgTrustScore
-    }));
-
-    // Update final state with merged results so ClaimsList can render
-    setClaims({
-      ...claimsData,
-      searchResults: mergedResults,
-      analysis: batchData,
-      factChecks: factCheckResults
-    });
-    
-    setShowClaimsPanel(true);
-    setLoadingState(prev => ({ ...prev, step4: false, step5: true }));
-
-  } catch (error) {
-    console.error('Error:', error);
-    setError(error instanceof Error ? error.message : 'An unknown error occurred');
-  } finally {
-    setIsLoading(false);
-  }
-};
+  };
 
   const handleClaimify = async () => {
     if (!url.trim()) {
@@ -379,10 +507,15 @@ export default function Home() {
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
-      mode === 'analyze' ? handleAnalyze() : handleClaimify();
+      if (mode === 'analyze') {
+        handleAnalyze();
+      } else {
+        handleClaimify();
+      }
     }
   };
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const searchClaims = async (claimsData: ClaimsResponse, originalUrl: string) => {
     try {
       // 1. Get search results
@@ -523,13 +656,21 @@ export default function Home() {
         // Debug log to see what we're getting
         console.log(`Fact-check result for claim ${index}:`, fc);
         
+        // Normalize reference into either `reference` (string) or `Reference` (string[])
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const refAny = (fc as any)?.reference ?? (fc as any)?.Reference;
+        const refString = typeof refAny === 'string' ? refAny : undefined;
+        const refArray = Array.isArray(refAny) ? refAny as string[] : undefined;
+
         return {
           ...representative,
           relevantChunks: group.flatMap((g: SearchResult & { relevantChunks?: RelevantChunk[] }) => g.relevantChunks || []),
+          factCheckSourceUrls: group.slice(0, 3).map((g: SearchResult) => g.url).filter(Boolean),
           // Map the fact-check fields to the expected case
           verdict: fc?.verdict || fc?.Verdict, // Try both cases
           reason: fc?.reason || fc?.Reason,
-          reference: fc?.reference || fc?.Reference,
+          ...(refString ? { reference: refString } : {}),
+          ...(refArray ? { Reference: refArray } : {}),
           trustScore: typeof fc?.trustScore === 'number' ? fc.trustScore : 
                      typeof fc?.Trust_Score === 'number' ? fc.Trust_Score :
                      typeof fc?.trust_score === 'number' ? fc.trust_score : undefined,
@@ -620,7 +761,7 @@ export default function Home() {
           </p>*/}
         </div>
         
-        <div className="bg-white p-8 rounded-none border-2 border-black shadow-[8px_8px_0_0_rgba(0,0,0,1)]">
+        <div className="bg-white p-6 border-2 border-black">
           <div className="flex flex-col sm:flex-row gap-3 w-full">
             <div className="relative flex-1">
               <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
@@ -758,90 +899,116 @@ export default function Home() {
                         <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-700"></div>
                       </div>
                     ) : (
-                      analysisState.avgTrustScore ?? 0
+                      typeof analysisState.avgTrustScore === 'number' 
+                        ? analysisState.avgTrustScore.toFixed(2) 
+                        : '0.00'
                     )}
                   </div>
                 </div>
+
+                {/* Box 6: Opinion Bias (on Not Verifiable items) */}
+                <div className="p-2 bg-purple-50 border border-purple-300 rounded col-span-2">
+                  <div className="text-gray-800">Opinion Bias (Not Verifiable)</div>
+                  {loadingState.step1 || loadingState.step2 || loadingState.step3 || loadingState.step4 ? (
+                    <div className="flex items-center w-full mt-1">
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-purple-700 mr-2"></div>
+                      <span className="text-gray-600">Classifying opinions...</span>
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap gap-2 mt-1 items-center">
+                      <span className="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded">
+                        Positive: {analysisState.bias?.positivePercent ?? 0}%
+                      </span>
+                      <span className="text-xs bg-red-100 text-red-800 px-2 py-0.5 rounded">
+                        Negative: {analysisState.bias?.negativePercent ?? 0}%
+                      </span>
+                      <span className="text-xs bg-gray-100 text-gray-800 px-2 py-0.5 rounded">
+                        Other: {analysisState.bias?.otherPercent ?? 0}%
+                      </span>
+                      <span className="ml-auto text-xs text-gray-600">
+                        Total: {analysisState.bias?.total ?? 0}
+                      </span>
+                    </div>
+                  )}
+                </div>
                 </div>
               </div>
             </div>
           )}
-        </div>
-        
-        <div className="mt-6 flex flex-col sm:flex-row gap-3 justify-center">
-          <a
-            href="/api/download/extension"
-            className="bg-black text-white font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200 text-center"
-          >
-            DOWNLOAD EXTENSION
-          </a>
-          <button
-            onClick={() => setShowInstall(true)}
-            className="bg-white text-black font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200 text-center"
-          >
-            HOW TO INSTALL
-          </button>
-          
-          {/* Toggle Claims Panel Button - Show when claims exist but panel is closed */}
-          {claims && !showClaimsPanel && (
+          </div>
+
+          <div className="mt-6 flex flex-col sm:flex-row gap-3 justify-center">
+            <a
+              href="/api/download/extension"
+              className="bg-black text-white font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200 text-center"
+            >
+              DOWNLOAD EXTENSION
+            </a>
             <button
-              onClick={() => setShowClaimsPanel(true)}
+              onClick={() => setShowInstall(true)}
               className="bg-white text-black font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200 text-center"
             >
-              VIEW CLAIMS
+              HOW TO INSTALL
             </button>
+            {/* Toggle Claims Panel Button - Show when claims exist but panel is closed */}
+            {claims && !showClaimsPanel && (
+              <button
+                onClick={() => setShowClaimsPanel(true)}
+                className="bg-white text-black font-medium py-3 px-6 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200 text-center"
+              >
+                VIEW CLAIMS
+              </button>
+            )}
+          </div>
+
+          {showInstall && (
+            <div
+              className="fixed inset-0 z-50 flex items-center justify-center"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="install-extension-title"
+            >
+              <div className="absolute inset-0 bg-black/50" onClick={() => setShowInstall(false)} />
+              <div className="relative z-10 w-full max-w-lg mx-4 bg-white p-8 rounded-none border-2 border-black shadow-[8px_8px_0_0_rgba(0,0,0,1)]">
+                <div className="flex items-start justify-between">
+                  <h2 id="install-extension-title" className="text-2xl font-black text-black tracking-tight">Install the Chrome extension</h2>
+                  <button
+                    onClick={() => setShowInstall(false)}
+                    className="ml-4 -mt-2 text-black border-2 border-black px-2 py-1 hover:bg-black hover:text-white transition-all duration-200"
+                    aria-label="Close"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <ol className="mt-4 list-decimal list-inside space-y-2 text-gray-900 text-sm text-left">
+                  <li>Click <span className="font-semibold">DOWNLOAD EXTENSION</span> on the main page to get <code className="font-mono">extension.zip</code>.</li>
+                  <li>Extract the ZIP to a folder on your computer.</li>
+                  <li>Open Chrome and go to <span className="font-mono">chrome://extensions</span>.</li>
+                  <li>Enable <span className="font-semibold">Developer mode</span> (top-right).</li>
+                  <li>Click <span className="font-semibold">Load unpacked</span> and select the extracted <code className="font-mono">extension/</code> folder.</li>
+                  <li>Pin the extension from the toolbar for quick access.</li>
+                </ol>
+                <div className="mt-6 flex justify-end gap-3">
+                  <a
+                    href="/api/download/extension"
+                    className="bg-black text-white font-medium py-2 px-4 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200"
+                  >
+                    Download ZIP
+                  </a>
+                  <button
+                    onClick={() => setShowInstall(false)}
+                    className="bg-white text-black font-medium py-2 px-4 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200"
+                  >
+                    Close
+                  </button>
+                </div>
+                <p className="text-xs text-gray-700 mt-4">
+                  To update later, remove the old version in <span className="font-mono">chrome://extensions</span> and load the new extracted folder again.
+                </p>
+              </div>
+            </div>
           )}
         </div>
-
-        {showInstall && (
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="install-extension-title"
-          >
-            <div className="absolute inset-0 bg-black/50" onClick={() => setShowInstall(false)} />
-            <div className="relative z-10 w-full max-w-lg mx-4 bg-white p-8 rounded-none border-2 border-black shadow-[8px_8px_0_0_rgba(0,0,0,1)]">
-              <div className="flex items-start justify-between">
-                <h2 id="install-extension-title" className="text-2xl font-black text-black tracking-tight">Install the Chrome extension</h2>
-                <button
-                  onClick={() => setShowInstall(false)}
-                  className="ml-4 -mt-2 text-black border-2 border-black px-2 py-1 hover:bg-black hover:text-white transition-all duration-200"
-                  aria-label="Close"
-                >
-                  ✕
-                </button>
-              </div>
-              <ol className="mt-4 list-decimal list-inside space-y-2 text-gray-900 text-sm text-left">
-                <li>Click <span className="font-semibold">DOWNLOAD EXTENSION</span> on the main page to get <code className="font-mono">extension.zip</code>.</li>
-                <li>Extract the ZIP to a folder on your computer.</li>
-                <li>Open Chrome and go to <span className="font-mono">chrome://extensions</span>.</li>
-                <li>Enable <span className="font-semibold">Developer mode</span> (top-right).</li>
-                <li>Click <span className="font-semibold">Load unpacked</span> and select the extracted <code className="font-mono">extension/</code> folder.</li>
-                <li>Pin the extension from the toolbar for quick access.</li>
-              </ol>
-              <div className="mt-6 flex justify-end gap-3">
-                <a
-                  href="/api/download/extension"
-                  className="bg-black text-white font-medium py-2 px-4 rounded-none border-2 border-black hover:bg-white hover:text-black transition-all duration-200"
-                >
-                  Download ZIP
-                </a>
-                <button
-                  onClick={() => setShowInstall(false)}
-                  className="bg-white text-black font-medium py-2 px-4 rounded-none border-2 border-black hover:bg-black hover:text-white transition-all duration-200"
-                >
-                  Close
-                </button>
-              </div>
-              <p className="text-xs text-gray-700 mt-4">
-                To update later, remove the old version in <span className="font-mono">chrome://extensions</span> and load the new extracted folder again.
-              </p>
-            </div>
-          </div>
-        )}
-        </div>
-        
         {/* Right Panel - Claims List (slides in from right) */}
         {showClaimsPanel && claims && (
           <div className={`w-1/2 flex-shrink-0 transition-all duration-500 ease-in-out transform ${

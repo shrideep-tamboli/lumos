@@ -21,7 +21,7 @@ async function extractArticleText(url: string): Promise<{
         source: 'article-extractor'
       };
     }
-  } catch (e) {
+  } catch {
     console.warn("Article-extractor failed, falling back to cheerio...");
   }
 

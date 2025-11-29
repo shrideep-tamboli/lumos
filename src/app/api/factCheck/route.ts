@@ -1,17 +1,46 @@
 import { NextResponse } from 'next/server';
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
+import { groq } from '@ai-sdk/groq';
+import { generateObject } from 'ai';
+import { z } from 'zod';
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY!,
   vertexai: false,
 });
 
+const factCheckSchema = z.union([
+  z.object({
+    claim: z.string(),
+    Verdict: z.enum(["Support", "Partially Support", "Unclear", "Contradict", "Refute"]),
+    Reason: z.string().min(1).max(600),
+    Reference: z.array(z.string()).min(0).max(3),
+    Trust_Score: z.number().min(-100).max(100)
+  }),
+  z.array(
+    z.object({
+      claim: z.string(),
+      Verdict: z.enum(["Support", "Partially Support", "Unclear", "Contradict", "Refute"]),
+      Reason: z.string().min(1).max(600),
+      Reference: z.array(z.string()).min(0).max(3),
+      Trust_Score: z.number().min(-100).max(100)
+    })
+  )
+]);
+
 interface EmbeddingValue { values: number[]; }
 interface EmbeddingResponse { embeddings: EmbeddingValue[]; }
 
-const RATE_LIMIT_DELAY = 100;
-const MAX_REQUEST_DURATION = 300000; // 5 minutes max request duration
-let lastRequestTime = 0;
+// Rate limiting and retry configuration
+const MAX_RETRIES = 3; // Maximum number of retries for a failed request
+const INITIAL_RETRY_DELAY = 1000; // Initial retry delay in ms
+const MAX_RETRY_DELAY = 60000; // Maximum retry delay in ms (1 minute)
+const TOKENS_PER_MINUTE_LIMIT = 10000; // API limit: 10k tokens per minute
+const REQUESTS_PER_MINUTE_LIMIT = 60; // API limit: 60 requests per minute
+
+// Add these new variables at the top with other rate limiting variables
+let lastRequestTimes: number[] = []; // For tracking request rate
+let tokenEvents: { ts: number; tokens: number }[] = []
 
 // Helper function to create a promise that rejects after a timeout
 function timeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -32,19 +61,171 @@ function timeout<T>(promise: Promise<T>, ms: number): Promise<T> {
     );
   });
 }
-async function rateLimit() {
-  const now = Date.now();
-  const timeSinceLastRequest = now - lastRequestTime;
-  if (timeSinceLastRequest < RATE_LIMIT_DELAY) {
-    await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY - timeSinceLastRequest));
+
+let schedulerRunning = false;
+
+interface QueueItem<T = unknown> {
+  run: () => Promise<T>;
+  estimatedTokens: number;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+}
+
+// Array to hold pending queue items
+const pendingQueue: QueueItem<unknown>[] = [];
+
+async function scheduleLoop() {
+  if (schedulerRunning) return;
+  schedulerRunning = true;
+  while (pendingQueue.length > 0) {
+    const now = Date.now();
+    lastRequestTimes = lastRequestTimes.filter(t => now - t < 60000);
+    tokenEvents = tokenEvents.filter(e => now - e.ts < 60000);
+    const tokensUsed = tokenEvents.reduce((s, e) => s + e.tokens, 0);
+    let reqSlots = Math.max(0, REQUESTS_PER_MINUTE_LIMIT - lastRequestTimes.length);
+    let tokenBudget = Math.max(0, TOKENS_PER_MINUTE_LIMIT - tokensUsed);
+
+    pendingQueue.sort((a, b) => a.estimatedTokens - b.estimatedTokens);
+
+    let launched = 0;
+    while (pendingQueue.length > 0 && reqSlots > 0) {
+      const next = pendingQueue[0];
+      if (next && next.estimatedTokens <= tokenBudget) {
+        const item = pendingQueue.shift();
+        if (item) {
+          reqSlots -= 1;
+          tokenBudget -= item.estimatedTokens;
+          lastRequestTimes.push(now);
+          tokenEvents.push({ ts: now, tokens: item.estimatedTokens });
+          (async () => {
+            try {
+              const res = await withRetry(item.run);
+              item.resolve(res);
+            } catch (e) {
+              item.reject(e);
+            }
+          })();
+          launched += 1;
+        } else {
+          break;
+        }
+      } else {
+        break;
+      }
+    }
+
+    if (launched === 0) {
+      const nextReqWait = lastRequestTimes.length >= REQUESTS_PER_MINUTE_LIMIT ? Math.max(0, 60000 - (now - lastRequestTimes[0])) : 0;
+      const nextTokWait = tokenEvents.length > 0 ? Math.max(0, 60000 - (now - tokenEvents[0].ts)) : 0;
+      const waitTime = Math.max(nextReqWait, nextTokWait, 10);
+      await new Promise(r => setTimeout(r, waitTime));
+    } else {
+      await new Promise(r => setTimeout(r, 0));
+    }
   }
-  lastRequestTime = Date.now();
+  schedulerRunning = false;
+}
+
+function enqueueRateLimited<T>(fn: () => Promise<T>, estimatedTokens: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const queueItem: QueueItem<T> = {
+      run: fn,
+      estimatedTokens,
+      resolve: (value: T | PromiseLike<T>) => resolve(value),
+      reject: (reason?: unknown) => reject(reason)
+    };
+    (pendingQueue as QueueItem<T>[]).push(queueItem);
+    void scheduleLoop();
+  });
+}
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  retries = MAX_RETRIES,
+  delay = INITIAL_RETRY_DELAY
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error: unknown) {
+    if (retries <= 0) {
+      throw error;
+    }
+
+    // Define interfaces for error types
+    interface ErrorWithMessage {
+      message: string;
+      [key: string]: unknown;
+    }
+
+    interface ErrorWithResponse {
+      response: {
+        status: number;
+        headers?: Record<string, unknown>;
+        [key: string]: unknown;
+      };
+      [key: string]: unknown;
+    }
+
+    // Type guard for error with message
+    const isErrorWithMessage = (e: unknown): e is ErrorWithMessage => {
+      return typeof e === 'object' && e !== null && 'message' in e && 
+             typeof (e as ErrorWithMessage).message === 'string';
+    };
+
+    // Type guard for error with response
+    const isErrorWithResponse = (e: unknown): e is ErrorWithResponse => {
+      if (typeof e !== 'object' || e === null) return false;
+      const error = e as ErrorWithResponse;
+      return 'response' in error && 
+             typeof error.response === 'object' && 
+             error.response !== null && 
+             'status' in error.response;
+    };
+
+    // Check for rate limit error
+    const isRateLimitError = 
+      (isErrorWithMessage(error) && error.message.includes('Rate limit reached')) ||
+      (isErrorWithResponse(error) && error.response.status === 429);
+
+    if (isRateLimitError) {
+      let retryAfter = delay;
+      if (isErrorWithResponse(error)) {
+        const headers = error.response.headers as Record<string, unknown> | undefined;
+        if (headers) {
+          if ('retry-after' in headers) {
+            retryAfter = typeof headers['retry-after'] === 'number' 
+              ? headers['retry-after'] 
+              : delay;
+          } else if ('x-ratelimit-reset-tokens' in headers) {
+            retryAfter = typeof headers['x-ratelimit-reset-tokens'] === 'number'
+              ? headers['x-ratelimit-reset-tokens']
+              : delay;
+          }
+        }
+      }
+      
+      const waitTime = Math.min(
+        retryAfter * 1000,
+        MAX_RETRY_DELAY
+      );
+      
+      console.log(`Rate limited. Retrying in ${waitTime}ms... (${retries} retries left)`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      return withRetry(fn, retries - 1, Math.min(delay * 2, MAX_RETRY_DELAY));
+    }
+
+    // For other errors, use exponential backoff
+    const errorMessage = isErrorWithMessage(error) ? error.message : 'Unknown error';
+    console.log(`Error: ${errorMessage}. Retrying in ${delay}ms... (${retries} retries left)`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return withRetry(fn, retries - 1, Math.min(delay * 2, MAX_RETRY_DELAY));
+  }
 }
 
 async function generateEmbedding(text: string): Promise<number[]> {
   if (!text.trim()) return [];
   try {
-    console.log(`Generating embedding for text (${text.length} chars)`);
+    //console.log(`Generating embedding for text (${text.length} chars)`);
     //await rateLimit();
     const resp = await timeout(ai.models.embedContent({ 
       model: "text-embedding-004", 
@@ -90,7 +271,7 @@ async function getTopSentences(claim: string, text: string, maxSentences: number
   const sentences = splitIntoSentences(text);
   // Skip embeddings if content is already short (huge performance win!)
   if (sentences.length <= maxSentences * 2) {
-    console.log(`⚡ Skipping embeddings - content already short (${sentences.length} sentences)`);
+    //console.log(`⚡ Skipping embeddings - content already short (${sentences.length} sentences)`);
     return sentences.slice(0, maxSentences);
   }
   
@@ -136,17 +317,8 @@ export async function POST(request: Request) {
   
   console.log(`[${requestId}] Starting fact-check request`);
   
-  // Set up a timeout for the entire request
-  const timeoutPromise = new Promise((_, reject) => 
-    setTimeout(() => reject(new Error('Request timed out')), MAX_REQUEST_DURATION)
-  );
-
   try {
     const requestBody = await request.json();
-    console.log('Received fact-check request:', JSON.stringify({
-      claimsCount: requestBody?.claims?.length || 0,
-      sampleClaim: requestBody?.claims?.[0]
-    }, null, 2));
     
     const { claims: claimContents } = requestBody as FactCheckRequest;
 
@@ -237,52 +409,11 @@ Format example:
 ]`;
   
     // Helper function to normalize and validate results
-    interface ParsedItem {
-      claim?: string;
-      Verdict?: string;
-      Reason?: string | null;
-      Reference?: string | string[] | null;
-      Trust_Score?: number;
-      [key: string]: unknown;
-    }
+    
 
-    function normalizeResults(parsed: ParsedItem[]): Array<{claim: string; Verdict: string; Reason: string; Reference: string[]; Trust_Score: number}> {
-      const normalize = (v: string) => (v || '').trim().toLowerCase();
-      
-      const scoreFor = (v: string): number => {
-        const n = normalize(v);
-        if (n === 'support' || n === 'supports') return 100;
-        if (n === 'partially support' || n === 'partially_supports' || n === 'partially-supports') return 65;
-        if (n === 'unclear' || n === 'neutral') return 0;
-        if (n === 'contradict' || n === 'refute' || n === 'contradicts' || n === 'refutes') return -100;
-        return 0;
-      };
-
-      return (parsed || []).map(item => {
-        const verdicts = ['Support', 'Partially Support', 'Unclear', 'Contradict', 'Refute'] as const;
-        const verdict = item.Verdict ?? '';
-        const isValidVerdict = verdicts.includes(verdict as typeof verdicts[number]);
-        
-        return {
-          claim: item.claim || 'Unknown claim',
-          Verdict: isValidVerdict ? verdict : 'Unclear',
-          Reason: typeof item.Reason === 'string'
-            ? item.Reason.trim()
-            : '',
-          Reference: Array.isArray(item.Reference) 
-            ? (item.Reference as string[]).filter((ref): ref is string => ref != null).map(String) 
-            : item.Reference 
-              ? [String(item.Reference)] 
-              : [],
-          Trust_Score: typeof item.Trust_Score === 'number' && !isValidVerdict
-            ? Math.max(0, Math.min(100, item.Trust_Score))
-            : scoreFor(verdict)
-        };
-      });
-    };
 
     // Process claims in batches to avoid token limits
-    const BATCH_SIZE = 5; // Adjust based on average claim complexity
+    const BATCH_SIZE = 1; // Adjust based on average claim complexity
     const batchResults = [];
 
     for (let i = 0; i < perClaimChunks.length; i += BATCH_SIZE) {
@@ -292,57 +423,27 @@ Format example:
       try {
         console.log(`[${requestId}] Processing batch ${i / BATCH_SIZE + 1} of ${Math.ceil(perClaimChunks.length / BATCH_SIZE)}`);
         
-        const gen = await timeout(ai.models.generateContent({
-          model: "gemini-2.0-flash",
-          contents: batchPrompt,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  claim: { type: Type.STRING },
-                  Verdict: { 
-                    type: Type.STRING,
-                    enum: ["Support", "Partially Support", "Unclear", "Contradict", "Refute"]
-                  },
-                  Reason: {
-                    type: Type.STRING,
-                    minLength: 1,
-                    maxLength: 600
-                  },
-                  Reference: { 
-                    type: Type.ARRAY, 
-                    items: { type: Type.STRING },
-                    minItems: 1,
-                    maxItems: 3
-                  },
-                  Trust_Score: { 
-                    type: Type.NUMBER,
-                    minimum: 0,
-                    maximum: 100
-                  },
-                },
-                required: ["claim", "Verdict", "Reason", "Reference", "Trust_Score"],
-                additionalProperties: false
-              }
-            }
-          }
-        }), 120000); // 2 minute timeout per batch
+        // Estimate tokens (roughly 1 token = 4 chars for English text)
+        const estimatedTokens = Math.min(1200, Math.ceil(batchPrompt.length / 4));
+        
+        // Queue the request to respect RPM and TPM
+        const result = await enqueueRateLimited(async () => {
+          return await generateObject({
+            model: groq('moonshotai/kimi-k2-instruct-0905'),
+            schema: factCheckSchema,
+            prompt: batchPrompt,
+          });
+        }, estimatedTokens);
 
-        if (gen?.text) {
-          try {
-            const parsedBatch = JSON.parse(gen.text);
-            const normalized = normalizeResults(parsedBatch);
-            console.log(`[${requestId}] Batch ${i / BATCH_SIZE + 1} completed with ${normalized.length} results`);
-            batchResults.push(...normalized);
-          } catch (parseError) {
-            console.error(`[${requestId}] Error parsing batch response:`, parseError);
-            throw new Error('Failed to parse model response');
-          }
-        } else {
-          throw new Error('Empty or invalid response from model');
+        try {
+          const normalizedResults = Array.isArray(result.object) 
+            ? result.object 
+            : [result.object];
+          console.log(`[${requestId}] Batch ${i / BATCH_SIZE + 1} completed with ${normalizedResults.length} results`);
+          batchResults.push(...normalizedResults);
+        } catch (parseError) {
+          console.error(`[${requestId}] Error processing batch response:`, parseError);
+          throw new Error('Failed to process model response');
         }
       } catch (error) {
         console.error(`Error processing batch ${i / BATCH_SIZE + 1}:`, error);

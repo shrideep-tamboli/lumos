@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Info, AlertCircle, CheckCircle, XCircle, HelpCircle } from 'lucide-react';
+import { AlertCircle, CheckCircle, XCircle, HelpCircle } from 'lucide-react';
 import { ReclaimifyApiResponse, DisambiguationResult, RewrittenPartial, CategorizedSentence } from '@/types';
 
 interface ReclaimifyResponseViewerProps {
@@ -119,7 +119,7 @@ implicitClaims: sentence.implicitClaims,
         : []);
 
   return (
-    <div className={`bg-gray-50 border border-gray-300 rounded p-4 ${className}`}>
+    <div className={`bg-white p-6 border-2 border-black ${className}`}>
       <h3 className="font-bold text-black mb-3">Claimify Analysis</h3>
       
       {/* Tabs */}
@@ -212,7 +212,7 @@ implicitClaims: sentence.implicitClaims,
 
       {/* Detailed Analysis View */}
       {activeTab === 'details' && (
-        <div className="space-y-4">
+        <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2">
           {enriched.length > 0 ? (
             <div className="space-y-3">
               {enriched.map((sentence, index: number) => (

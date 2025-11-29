@@ -9,7 +9,7 @@
 import { useState, useEffect, Suspense } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
-import { Loader2, Info } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 
 interface DisambiguationResult {
   sentence: string;
@@ -55,7 +55,6 @@ function ReclaimifyContent() {
   const url = searchParams.get('url') || '';
   
   const [title, setTitle] = useState('');
-  const [excerpt, setExcerpt] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sentences, setSentences] = useState<CategorizedSentence[]>([]);
@@ -84,7 +83,6 @@ function ReclaimifyContent() {
           url: extractData.url || url,
           content: extractData.content,
           title: extractData.title,
-          excerpt: extractData.excerpt
         })
       });
       
@@ -99,7 +97,6 @@ function ReclaimifyContent() {
       }
       
       setTitle(data.title || '');
-      setExcerpt(data.excerpt || '');
       
       // Use categorized sentences if available, otherwise use plain sentences
       if (data.categorizedSentences && Array.isArray(data.categorizedSentences)) {
@@ -198,7 +195,6 @@ function ReclaimifyContent() {
       }
       
       setTitle(data.title || '');
-      setExcerpt(data.excerpt || '');
       
       if (data.categorizedSentences && Array.isArray(data.categorizedSentences)) {
         const categorized = [...data.categorizedSentences] as CategorizedSentence[];

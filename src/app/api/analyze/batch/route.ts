@@ -34,19 +34,6 @@ interface UrlObject {
   [key: string]: unknown;
 }
 
-// Configure article extractor with custom options
-const extractorOptions = {
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    'Referer': 'https://www.google.com/'
-  },
-  // Add any additional extractor options here
-  // For example: forceExtractor: 'default',
-};
 
 function cleanText(text: string): string {
   if (!text) return '';
@@ -157,16 +144,17 @@ export async function POST(request: Request) {
       );
     }
 
-    // Process all URLs in parallel with concurrency control
-    const CONCURRENCY_LIMIT = 20; // Number of concurrent requests
-    const REQUEST_TIMEOUT = 15000; // 15 seconds timeout per request
+    // Configuration
+    const REQUEST_TIMEOUT = 60000; // Increased to 60 seconds
+    const MAX_RETRIES = 2; // Maximum number of retry attempts
+    const RETRY_DELAY = 5000; // 5 seconds delay between retries
     
-    // Process URLs in parallel with concurrency control
-    const processUrl = async (item: { url: string; claim?: string }): Promise<ExtractContentResult> => {
+    // Process URLs with retry logic
+    const processUrl = async (item: { url: string; claim?: string }, attempt = 0): Promise<ExtractContentResult> => {
       try {
         // Add a timeout to prevent hanging requests
         const timeoutPromise = new Promise<never>((_, reject) => 
-          setTimeout(() => reject(new Error('Request timeout')), REQUEST_TIMEOUT)
+          setTimeout(() => reject(new Error(`Request timeout after ${REQUEST_TIMEOUT}ms`)), REQUEST_TIMEOUT)
         );
         
         // Race between the extraction and the timeout
@@ -176,12 +164,26 @@ export async function POST(request: Request) {
         ]);
         
         return result;
-      } catch (error) {
-        console.error(`Error processing ${item.url}:`, error);
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        console.warn(`Attempt ${attempt + 1} failed for ${item.url}:`, errorMessage);
+        
+        // Retry logic for timeout and network-related errors
+        const shouldRetry = attempt < MAX_RETRIES && 
+          (errorMessage.includes('timeout') || 
+           errorMessage.includes('network') || 
+           errorMessage.includes('ECONN'));
+        
+        if (shouldRetry) {
+          console.log(`Retrying ${item.url} (attempt ${attempt + 1}/${MAX_RETRIES})...`);
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * (attempt + 1)));
+          return processUrl(item, attempt + 1);
+        }
+        
         return {
           url: item.url,
           content: '',
-          error: error instanceof Error ? error.message : 'Unknown error during processing',
+          error: errorMessage,
           claim: item.claim || ''
         };
       }

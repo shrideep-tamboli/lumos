@@ -159,7 +159,7 @@ For every item, respond with:
 - id
 - sentence
 - category: one of "Verifiable", "Partially Verifiable", "Not Verifiable"
-  - "Verifiable": Contains explicit, objective, falsifiable claims
+  - "Verifiable": Contains explicit, objective, falsifiable claims. It should be worth of a claim made in a new article.
   - "Partially Verifiable": Contains implicit factual claims hidden in rhetorical/subjective language, OR mix of verifiable and subjective elements
   - "Not Verifiable": Pure opinion, speculation, or no factual content whatsoever
 - reasoning: concise justification (if "Partially Verifiable" due to implicit claims, mention this)
@@ -263,14 +263,11 @@ async function extractImplicitClaims(items: ImplicitClaimInput[]): Promise<Impli
     const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
     const prompt = `You assist fact-checkers by extracting implicit factual claims from rhetorical, opinionated, or question-based sentences.
 
-CRITICAL: Extract factual sub-claims that can be objectively verified, even if the original sentence is a question or contains subjective language.
+CRITICAL: Extract factual sub-claims with full context from the original sentence that can be objectively verified, even if the original sentence is a question or contains subjective language.
 
 Examples:
-- Input: "What is China afraid of to keep Tibet in such tight control?"
-  Output: ["China exercises tight control over Tibet"]
-  
-- Input: "Why are Tibetans living in such inhuman conditions?"
-  Output: ["Tibetans are living in poor conditions"]
+- Input: "What is China afraid of to keep Tibet in such a tight control and Tibetans in such an inhuman existence in our own country?"
+  Output: ["China exercises tight control over Tibet.", "Tibetans are facing inhumane treatment or conditions under Chinese control."]
   
 - Input: "This is the best product ever"
   Output: [] (no verifiable factual claim)
@@ -502,7 +499,12 @@ async function processSentencesMultiStep(sentences: string[]): Promise<{
       });
     }
 
-    processedImplicitClaims = implicitProcessed.map(({ id, candidateSentence, disambiguationSource, ...rest }) => rest);
+    processedImplicitClaims = implicitProcessed.map((item) => {
+      const copy: Record<string, unknown> = { ...item };
+      const keysToRemove = ['id', 'candidateSentence', 'disambiguationSource'] as const;
+      keysToRemove.forEach((k) => delete copy[k as keyof typeof copy]);
+      return copy as unknown as ProcessedSentence;
+    });
   }
 
   const partialInputs: RewriteInput[] = processed
@@ -600,7 +602,12 @@ async function processSentencesMultiStep(sentences: string[]): Promise<{
   });
 
   return {
-    processedSentences: processed.map(({ id, candidateSentence, disambiguationSource, ...rest }) => rest),
+    processedSentences: processed.map((item) => {
+      const copy: Record<string, unknown> = { ...item };
+      const keysToRemove = ['id', 'candidateSentence', 'disambiguationSource'] as const;
+      keysToRemove.forEach((k) => delete copy[k as keyof typeof copy]);
+      return copy as unknown as ProcessedSentence;
+    }),
     processedImplicitClaims,
   };
 }
@@ -705,3 +712,4 @@ const allVerifiableClaims = [...VerifiableClaims, ...additionalImplicitClaims];
     );
   }
 }
+

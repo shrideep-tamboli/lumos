@@ -1,6 +1,10 @@
 export interface RelevantChunk {
   text: string;
   similarity: number;
+  source?: {
+    url: string;
+    title?: string;
+  };
 }
 
 export interface SearchResult {
@@ -10,6 +14,7 @@ export interface SearchResult {
   excerpt?: string;
   error?: string;
   relevantChunks?: RelevantChunk[];
+  factCheckSourceUrls?: string[];
   // Support both camelCase and PascalCase for API response fields
   verdict?: "Support" | "Partially Support" | "Unclear" | "Contradict" | "Refute";
   Verdict?: "Support" | "Partially Support" | "Unclear" | "Contradict" | "Refute";
