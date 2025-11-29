@@ -7,10 +7,14 @@ import ClaimsList from '@/components/ClaimsList';
 import InfoDialog from '@/components/InfoDialog';
 import { ReclaimifyResponseViewer } from '@/components/ReclaimifyResponseViewer';
 import { RequestLog } from '@/components/RequestLogger';
-import { RequestLogger } from '@/components/RequestLogger';
 import { RequestProgressDialog } from '@/components/RequestProgressDialog';
 import { ThreeColumnLayout } from '@/components/ThreeColumnLayout';
+import WebSearchViewer from '@/components/WebSearchViewer';
+import FactCheckViewer from '@/components/FactCheckViewer';
 import { SearchResult, ClaimsResponse, ReclaimifyApiResponse, FactCheckResult } from '@/types';
+
+// Step navigation type
+type AnalysisStep = 'extract' | 'claimify' | 'websearch' | 'batch' | 'factcheck' | null;
 
 interface RelevantChunk {
   text: string;
@@ -118,8 +122,9 @@ export default function Home() {
     step5: false,
   });
 
-  const [showClaimsPanel, setShowClaimsPanel] = useState(false);
-  const [requestLogs, setRequestLogs] = useState<RequestLog[]>([]);
+  const [, setShowClaimsPanel] = useState(false);
+  // Request logging state (used by logRequest/updateRequestLog callbacks)
+  const [, setRequestLogs] = useState<RequestLog[]>([]);
   const [activeRequests, setActiveRequests] = useState<Array<{
     id: string;
     method: string;
@@ -129,8 +134,14 @@ export default function Home() {
   }>>([]);
   
   const progressIntervals = useRef<Record<string, NodeJS.Timeout>>({});
-  const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
+  const [, setSelectedRequestId] = useState<string | null>(null);
+
+  // Step navigation states
+  const [selectedStep, setSelectedStep] = useState<AnalysisStep>(null);
+  const [extractData, setExtractData] = useState<{ url: string; content: string; title?: string; excerpt?: string } | null>(null);
+  const [websearchData, setWebsearchData] = useState<{ urlsPerClaim: string[][]; claims: Array<{ claim: string; search_date: string }> } | null>(null);
+  const [factCheckResults, setFactCheckResults] = useState<FactCheckResult[]>([]);
+  const [batchResults, setBatchResults] = useState<BatchAnalysisResult[]>([]);
 
   const logRequest = useCallback((log: Omit<RequestLog, 'id' | 'timestamp'>) => {
     const id = uuidv4();
@@ -208,27 +219,13 @@ export default function Home() {
     }
   }, []);
 
-  const clearLogs = useCallback(() => {
-    setRequestLogs([]);
-    // Clear all progress intervals
-    Object.values(progressIntervals.current).forEach(interval => clearInterval(interval));
-    progressIntervals.current = {};
-    setActiveRequests([]);
-  }, []);
-
   // Clean up intervals on unmount
   useEffect(() => {
+    const currentIntervals = progressIntervals.current;
     return () => {
-      Object.values(progressIntervals.current).forEach(interval => clearInterval(interval));
+      Object.values(currentIntervals).forEach(interval => clearInterval(interval));
     };
   }, []);
-
-  const selectedRequest = selectedRequestId
-    ? requestLogs.find(l => l.id === selectedRequestId) || null
-    : (requestLogs[requestLogs.length - 1] || null);
-  const selectedActive = selectedRequest
-    ? activeRequests.find(a => a.id === selectedRequest.id)
-    : undefined;
 
   const handleAnalyze = async () => {
     if (!url.trim()) {
@@ -244,6 +241,11 @@ export default function Home() {
     setResult(null);
     setClaims(null);
     setReclaimifyData(null);
+    setExtractData(null);
+    setWebsearchData(null);
+    setFactCheckResults([]);
+    setBatchResults([]);
+    setSelectedStep(null);
     setLoadingState({
       step1: true,  // Starting step 1
       step2: false,
@@ -266,21 +268,30 @@ export default function Home() {
       });
       
       let extractResponse: Response;
-      let extractData: any;
+      let extractDataResponse: { url?: string; content?: string; title?: string; excerpt?: string; error?: string };
       
       try {
         extractResponse = await fetch(extractUrl);
-        extractData = await extractResponse.json();
+        extractDataResponse = await extractResponse.json();
         
         updateRequestLog(extractLogId, {
           status: extractResponse.ok ? 'success' : 'error',
-          response: extractData,
-          error: extractResponse.ok ? undefined : extractData.error || 'Failed to extract content'
+          response: extractDataResponse,
+          error: extractResponse.ok ? undefined : extractDataResponse.error || 'Failed to extract content'
         });
         
         if (!extractResponse.ok) {
-          throw new Error(extractData.error || 'Failed to extract content from URL');
+          throw new Error(extractDataResponse.error || 'Failed to extract content from URL');
         }
+        
+        // Save extract data for step navigation
+        setExtractData({
+          url: extractDataResponse.url || url.trim(),
+          content: extractDataResponse.content || '',
+          title: extractDataResponse.title,
+          excerpt: extractDataResponse.excerpt
+        });
+        setSelectedStep('extract');
       } catch (err) {
         updateRequestLog(extractLogId, {
           status: 'error',
@@ -291,10 +302,10 @@ export default function Home() {
       
       // 2. Send extracted content to reclaimify for processing (works for both regular URLs and YouTube URLs)
       const reclaimifyPayload = {
-        url: extractData.url || url.trim(),
-        content: extractData.content,
-        title: extractData.title,
-        excerpt: extractData.excerpt
+        url: extractDataResponse.url || url.trim(),
+        content: extractDataResponse.content,
+        title: extractDataResponse.title,
+        excerpt: extractDataResponse.excerpt
       };
       
       const reclaimifyLogId = logRequest({
@@ -308,7 +319,7 @@ export default function Home() {
       });
       
       let reclaimifyResponse: Response;
-      let reclaimifyData: ReclaimifyApiResponse;
+      let reclaimifyDataResponse: ReclaimifyApiResponse;
       
       try {
         reclaimifyResponse = await fetch('/api/reclaimify', {
@@ -317,16 +328,16 @@ export default function Home() {
           body: JSON.stringify(reclaimifyPayload)
         });
         
-        reclaimifyData = await reclaimifyResponse.json();
+        reclaimifyDataResponse = await reclaimifyResponse.json();
         
         updateRequestLog(reclaimifyLogId, {
           status: reclaimifyResponse.ok ? 'success' : 'error',
-          response: reclaimifyData,
-          error: reclaimifyResponse.ok ? undefined : (reclaimifyData as any).error || 'Failed to process content'
+          response: reclaimifyDataResponse,
+          error: reclaimifyResponse.ok ? undefined : (reclaimifyDataResponse as ReclaimifyApiResponse & { error?: string }).error || 'Failed to process content'
         });
         
         if (!reclaimifyResponse.ok) {
-          throw new Error((reclaimifyData as any).error || 'Failed to process content');
+          throw new Error((reclaimifyDataResponse as ReclaimifyApiResponse & { error?: string }).error || 'Failed to process content');
         }
       } catch (err) {
         updateRequestLog(reclaimifyLogId, {
@@ -335,13 +346,14 @@ export default function Home() {
         });
         throw err;
       }
-      setReclaimifyData(reclaimifyData);
-      setResult({ url: reclaimifyData.url || url.trim(), content: reclaimifyData.content || '' });
+      setReclaimifyData(reclaimifyDataResponse);
+      setSelectedStep('claimify');
+      setResult({ url: reclaimifyDataResponse.url || url.trim(), content: reclaimifyDataResponse.content || '' });
       setActiveTab('summary'); // Switch to Analysis Summary tab after getting reclaimify data
 
       // 3. Build verifiable claims from new API shape first, fallback to old
-      const verifiableFromArray = Array.isArray(reclaimifyData.verifiableClaims)
-        ? reclaimifyData.verifiableClaims.filter((s) => typeof s === 'string' && s.trim().length > 0)
+      const verifiableFromArray = Array.isArray(reclaimifyDataResponse.verifiableClaims)
+        ? reclaimifyDataResponse.verifiableClaims.filter((s) => typeof s === 'string' && s.trim().length > 0)
         : [];
 
       interface ProcessedSentence {
@@ -351,7 +363,7 @@ export default function Home() {
         [key: string]: unknown;
       }
 
-      const processedSentences = reclaimifyData.processedSentences as (ProcessedSentence & {
+      const processedSentences = reclaimifyDataResponse.processedSentences as (ProcessedSentence & {
         implicitClaims?: Array<string | { claim: string }>;
       })[] | undefined;
       const verifiableFromProcessed = Array.isArray(processedSentences)
@@ -370,8 +382,8 @@ export default function Home() {
             .filter((s) => s.length > 0)
         : [];
 
-      const categorized = Array.isArray(reclaimifyData.categorizedSentences)
-        ? reclaimifyData.categorizedSentences
+      const categorized = Array.isArray(reclaimifyDataResponse.categorizedSentences)
+        ? reclaimifyDataResponse.categorizedSentences
         : [];
       const verifiableFromCategorized = categorized
         .filter((item) => item.category === 'Verifiable')
@@ -390,8 +402,8 @@ export default function Home() {
       }
 
       // Collect Not Verifiable sentences for bias analysis
-      const notVerifiableItems: string[] = Array.isArray(reclaimifyData.processedSentences)
-        ? (reclaimifyData.processedSentences as ProcessedSentence[])
+      const notVerifiableItems: string[] = Array.isArray(reclaimifyDataResponse.processedSentences)
+        ? (reclaimifyDataResponse.processedSentences as ProcessedSentence[])
             .filter((s): s is ProcessedSentence & { originalSentence: string } => 
               s?.category === 'Not Verifiable' && 
               typeof s?.originalSentence === 'string' && 
@@ -461,6 +473,13 @@ export default function Home() {
       }
       
       const urlsPerClaim: string[][] = webSearchData.urls || [];
+      
+      // Save websearch data for step navigation
+      setWebsearchData({
+        urlsPerClaim,
+        claims: claimsData.claims
+      });
+      setSelectedStep('websearch');
       
       // Flatten URLs for batch extraction and create claim mapping
       const flattenedUrls: string[] = [];
@@ -539,14 +558,18 @@ export default function Home() {
         throw err;
       }
 
-      const batchResults: BatchAnalysisResult[] = Array.isArray(batchData?.results) 
+      const batchResultsLocal: BatchAnalysisResult[] = Array.isArray(batchData?.results) 
         ? batchData.results.filter(isBatchAnalysisResult) 
         : [];
+
+      // Save batch results for step navigation
+      setBatchResults(batchResultsLocal);
+      setSelectedStep('batch');
 
       // Group extracted contents per claim for fact checking
       const contentsByClaim: Record<string, string[]> = {};
       
-      batchResults.forEach((result) => {
+      batchResultsLocal.forEach((result) => {
         const claimKey = (result?.claim || '').toString().trim();
         const content = (result?.content || '').toString().trim();
         
@@ -561,7 +584,7 @@ export default function Home() {
       // 6. Call fact check with claims and their associated content
       setLoadingState(prev => ({ ...prev, step3: false, step4: true }));
 
-      let factCheckResults: FactCheckResult[] = [];
+      let factCheckResultsLocal: FactCheckResult[] = [];
       let averageTrustScore: number | undefined = undefined;
       let biasPercentages: { positive?: number; negative?: number; other?: number; total?: number } | undefined = undefined;
       const factCheckClaims = Object.entries(contentsByClaim).map(([claim, content]) => ({
@@ -637,12 +660,16 @@ export default function Home() {
 
         // Process fact check results
         const factCheckResponses = await Promise.all(factCheckPromises);
-        factCheckResults = factCheckResponses
+        factCheckResultsLocal = factCheckResponses
           .filter(response => response?.results?.length > 0)
           .flatMap(response => response.results);
+        
+        // Save fact check results progressively for step navigation
+        setFactCheckResults(factCheckResultsLocal);
+        setSelectedStep('factcheck');
 
         // Calculate average trust score from successful responses
-        const validScores = factCheckResults
+        const validScores = factCheckResultsLocal
           .filter(r => typeof r.trustScore === 'number' || typeof r.Trust_Score === 'number')
           .map(r => (r.trustScore ?? r.Trust_Score) as number); // Type assertion to ensure number[]
 
@@ -669,7 +696,7 @@ export default function Home() {
 
       // Merge fact-check results with batch extraction results per claim
       const groupedByClaim: Record<string, SearchResult[]> = {};
-      batchResults.forEach((r) => {
+      batchResultsLocal.forEach((r) => {
         const k = (r?.claim || '').toString().trim();
         if (!k) return;
         if (!groupedByClaim[k]) groupedByClaim[k] = [];
@@ -689,7 +716,7 @@ export default function Home() {
         const representative: SearchResult = group.length > 0
           ? group[0]
           : { url: '', content: '' };
-        const fc = factCheckResults.find((r) => (r?.claim || '').toString().trim() === claimText.trim());
+        const fc = factCheckResultsLocal.find((r) => (r?.claim || '').toString().trim() === claimText.trim());
         // Normalize reference into either `reference` (string) or `Reference` (string[])
         // Instead of using 'any', use the FactCheckResult interface
         const refAny = (fc as FactCheckResult)?.reference ?? (fc as FactCheckResult)?.Reference;
@@ -717,7 +744,7 @@ export default function Home() {
 
       // Update analysis summary metrics
       const verdictCounts = { support: 0, partially: 0, unclear: 0, contradict: 0, refute: 0 };
-      for (const fc of factCheckResults) {
+      for (const fc of factCheckResultsLocal) {
         const v = (fc?.verdict || fc?.Verdict || '').toString();
         if (v === 'Support') verdictCounts.support++;
         else if (v === 'Partially Support') verdictCounts.partially++;
@@ -745,7 +772,7 @@ export default function Home() {
         ...claimsData,
         searchResults: mergedResults,
         analysis: batchData,
-        factChecks: factCheckResults
+        factChecks: factCheckResultsLocal
       });
       
       setShowClaimsPanel(true);
@@ -955,51 +982,237 @@ export default function Home() {
     }
   };
 
+  // Render content based on selected step
+  const renderStepContent = () => {
+    switch (selectedStep) {
+      case 'extract':
+        if (!extractData) return null;
+        return (
+          <div className="bg-white border-2 border-black p-6 mt-6">
+            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+              <span>📄</span> Extracted Content
+            </h3>
+            <div className="space-y-4">
+              <div>
+                <div className="text-sm font-medium text-gray-600">Source URL</div>
+                <a href={extractData.url} target="_blank" rel="noopener noreferrer" 
+                   className="text-blue-600 hover:underline break-all">
+                  {extractData.url}
+                </a>
+              </div>
+              {extractData.title && (
+                <div>
+                  <div className="text-sm font-medium text-gray-600">Title</div>
+                  <div className="text-gray-900">{extractData.title}</div>
+                </div>
+              )}
+              {extractData.excerpt && (
+                <div>
+                  <div className="text-sm font-medium text-gray-600">Excerpt</div>
+                  <div className="text-gray-700 text-sm">{extractData.excerpt}</div>
+                </div>
+              )}
+              <div>
+                <div className="text-sm font-medium text-gray-600 mb-2">Content</div>
+                <div className="bg-gray-50 p-4 border border-gray-200 rounded max-h-96 overflow-y-auto text-sm text-gray-800 whitespace-pre-wrap">
+                  {extractData.content?.slice(0, 3000)}
+                  {extractData.content && extractData.content.length > 3000 && '...'}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'claimify':
+        if (!reclaimifyData) return null;
+        return (
+          <div className="bg-white border-2 border-black p-6 mt-6">
+            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+              <span>🔍</span> Claimify Results
+            </h3>
+            <ReclaimifyResponseViewer data={reclaimifyData} />
+          </div>
+        );
+
+      case 'websearch':
+        if (!websearchData) return null;
+        return (
+          <div className="bg-white border-2 border-black p-6 mt-6">
+            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+              <span>🌐</span> Web Search Results
+            </h3>
+            <WebSearchViewer 
+              claims={websearchData.claims}
+              urlsPerClaim={websearchData.urlsPerClaim}
+              isLoading={loadingState.step2}
+            />
+          </div>
+        );
+
+      case 'batch':
+        if (batchResults.length === 0) return null;
+        return (
+          <div className="bg-white border-2 border-black p-6 mt-6">
+            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+              <span>📦</span> Batch Analysis Results
+            </h3>
+            <div className="space-y-4">
+              <div className="text-sm text-gray-600">
+                Extracted content from {batchResults.length} sources
+              </div>
+              <div className="divide-y divide-gray-200 max-h-[500px] overflow-y-auto">
+                {batchResults.slice(0, 20).map((result, index) => (
+                  <div key={index} className="py-3">
+                    <div className="flex items-start gap-2">
+                      <span className="text-gray-400 font-mono text-sm">{index + 1}.</span>
+                      <div className="flex-1 min-w-0">
+                        <a href={result.url} target="_blank" rel="noopener noreferrer"
+                           className="text-blue-600 hover:underline text-sm truncate block">
+                          {result.url}
+                        </a>
+                        {result.title && (
+                          <div className="text-gray-900 text-sm font-medium mt-1">{result.title}</div>
+                        )}
+                        <div className="text-gray-600 text-xs mt-1">
+                          Claim: {result.claim?.slice(0, 100)}{(result.claim?.length ?? 0) > 100 ? '...' : ''}
+                        </div>
+                        {result.content && (
+                          <div className="text-gray-500 text-xs mt-1 line-clamp-2">
+                            {result.content.slice(0, 200)}...
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {batchResults.length > 20 && (
+                  <div className="py-3 text-center text-gray-500 text-sm">
+                    ... and {batchResults.length - 20} more results
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'factcheck':
+        return (
+          <div className="bg-white border-2 border-black p-6 mt-6">
+            <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+              <span>✓</span> Fact Check Results
+            </h3>
+            <FactCheckViewer 
+              claims={websearchData?.claims || []}
+              factCheckResults={factCheckResults}
+              isLoading={loadingState.step4}
+            />
+          </div>
+        );
+
+      default:
+        return null;
+    }
+  };
+
+  // Step navigation configuration
+  const steps: { id: AnalysisStep; label: string; icon: string; isActive: boolean; isComplete: boolean }[] = [
+    { 
+      id: 'extract', 
+      label: 'Extract', 
+      icon: '📄', 
+      isActive: loadingState.step1,
+      isComplete: !!extractData
+    },
+    { 
+      id: 'claimify', 
+      label: 'Claimify', 
+      icon: '🔍', 
+      isActive: loadingState.step1,
+      isComplete: !!reclaimifyData
+    },
+    { 
+      id: 'websearch', 
+      label: 'WebSearch', 
+      icon: '🌐', 
+      isActive: loadingState.step2,
+      isComplete: !!websearchData
+    },
+    { 
+      id: 'batch', 
+      label: 'Batch', 
+      icon: '📦', 
+      isActive: loadingState.step3,
+      isComplete: batchResults.length > 0
+    },
+    { 
+      id: 'factcheck', 
+      label: 'FactCheck', 
+      icon: '✓', 
+      isActive: loadingState.step4,
+      isComplete: factCheckResults.length > 0
+    },
+  ];
+
   // Left Sidebar Component
   const leftSidebar = (
     <div className="h-full flex flex-col">
       <div className="p-4 border-b border-gray-200">
-        <h2 className="font-bold text-lg">Requests</h2>
+        <h2 className="font-bold text-lg">Analysis Steps</h2>
       </div>
       <div className="flex-1 overflow-y-auto">
-        {requestLogs.length === 0 ? (
-          <div className="text-sm text-gray-600 p-4">No requests yet</div>
-        ) : (
-          <div className="divide-y divide-gray-200">
-            {requestLogs.map((log) => {
-              const ar = activeRequests.find(a => a.id === log.id);
-              const isSel = selectedRequestId === log.id;
-              return (
-                <button 
-                  key={log.id} 
-                  onClick={() => setSelectedRequestId(log.id)}
-                  className={`w-full text-left p-3 hover:bg-gray-50 ${isSel ? 'bg-blue-50' : ''}`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className={`text-sm font-mono truncate ${log.status === 'error' ? 'text-red-600' : 'text-gray-900'}`}>
-                      {log.method} {log.url}
-                    </span>
-                    <span className={`inline-block w-2 h-2 rounded-full ${
-                      log.status === 'success' ? 'bg-green-500' : 
-                      log.status === 'error' ? 'bg-red-500' : 'bg-yellow-500'
-                    }`}></span>
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">
-                    {new Date(log.timestamp).toLocaleTimeString()}
-                  </div>
-                  {log.status === 'pending' && (
-                    <div className="mt-1 w-full bg-gray-200 h-1.5">
-                      <div 
-                        className="bg-blue-600 h-1.5 transition-all duration-300" 
-                        style={{ width: `${ar?.progress ?? 0}%` }} 
-                      />
+        <div className="divide-y divide-gray-100">
+          {steps.map((step, index) => {
+            const isSelected = selectedStep === step.id;
+            const canClick = step.isComplete || step.isActive;
+            return (
+              <button 
+                key={step.id} 
+                onClick={() => canClick && setSelectedStep(step.id)}
+                disabled={!canClick}
+                className={`w-full text-left p-4 transition-all duration-200 ${
+                  isSelected ? 'bg-blue-50 border-l-4 border-blue-600' : 
+                  canClick ? 'hover:bg-gray-50 border-l-4 border-transparent' : 
+                  'opacity-50 cursor-not-allowed border-l-4 border-transparent'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <span className="text-xl">{step.icon}</span>
+                  <div className="flex-1">
+                    <div className="flex items-center justify-between">
+                      <span className={`font-medium ${isSelected ? 'text-blue-700' : 'text-gray-900'}`}>
+                        {index + 1}. {step.label}
+                      </span>
+                      {step.isActive && (
+                        <span className="inline-flex items-center">
+                          <span className="animate-spin h-4 w-4 border-2 border-blue-600 border-t-transparent rounded-full"></span>
+                        </span>
+                      )}
+                      {step.isComplete && !step.isActive && (
+                        <span className="text-green-600 text-sm font-medium">✓ Done</span>
+                      )}
                     </div>
-                  )}
-                </button>
-              );
-            })}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        
+        {/* Progress indicator */}
+        <div className="p-4 border-t border-gray-200">
+          <div className="text-xs text-gray-500 mb-2">Progress</div>
+          <div className="w-full bg-gray-200 rounded-full h-2">
+            <div 
+              className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+              style={{ 
+                width: `${(steps.filter(s => s.isComplete).length / steps.length) * 100}%` 
+              }}
+            />
           </div>
-        )}
+          <div className="text-xs text-gray-500 mt-1">
+            {steps.filter(s => s.isComplete).length} / {steps.length} steps completed
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -1133,6 +1346,9 @@ export default function Home() {
           HOW TO INSTALL
         </button>
       </div>
+
+      {/* Step-specific content display */}
+      {selectedStep && renderStepContent()}
     </div>
   );
 

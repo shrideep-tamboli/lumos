@@ -1,12 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
 export interface RequestLog {
   id: string;
   method: string;
   url: string;
   status: 'pending' | 'success' | 'error';
-  requestBody?: any;
-  response?: any;
+  requestBody?: unknown;
+  response?: unknown;
   error?: string;
   timestamp: Date;
   duration?: number;
@@ -28,7 +28,7 @@ export function RequestLogger({ logs, onClear, className = '' }: RequestLoggerPr
     }));
   };
 
-  const formatBody = (body: any): string => {
+  const formatBody = (body: unknown): string => {
     if (!body) return '';
     try {
       return JSON.stringify(body, null, 2);
@@ -95,7 +95,7 @@ export function RequestLogger({ logs, onClear, className = '' }: RequestLoggerPr
                   </pre>
                 </div>
                 
-                {log.response && (
+                {log.response !== undefined && log.response !== null && (
                   <div className="mt-2">
                     <div className="text-xs text-gray-500 mb-1">Response:</div>
                     <pre className="text-xs bg-gray-50 p-2 rounded overflow-auto max-h-60">

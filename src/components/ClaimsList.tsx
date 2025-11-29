@@ -1,4 +1,4 @@
-import { ClaimsListProps, SearchResult } from '@/types';
+import { ClaimsListProps } from '@/types';
 
 export default function ClaimsList({ claims, searchResults = [] }: ClaimsListProps) {
   if (!claims?.claims?.length) return null;
