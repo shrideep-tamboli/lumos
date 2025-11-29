@@ -705,4 +705,3 @@ const allVerifiableClaims = [...VerifiableClaims, ...additionalImplicitClaims];
     );
   }
 }
-

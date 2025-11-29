@@ -4,6 +4,37 @@ import * as cheerio from 'cheerio';
 import { extract } from '@extractus/article-extractor';
 import { getSubtitles } from 'youtube-caption-extractor';
 
+const SUPADATA_API_BASE_URL = 'https://api.supadata.ai/v1';
+const SUPADATA_POLL_INTERVAL_MS = 2000;
+const SUPADATA_MAX_POLL_ATTEMPTS = 5;
+
+// Supadata API types
+type SupadataTranscriptChunk = {
+  text: string;
+  offset: number;
+  duration: number;
+  lang: string;
+};
+
+type SupadataTranscriptResponse = {
+  content: string | SupadataTranscriptChunk[];
+  lang: string;
+  availableLangs: string[];
+  jobId?: string;
+};
+
+type SupadataJobResponse = {
+  jobId: string;
+};
+
+type SupadataJobStatus = {
+  status: 'queued' | 'active' | 'completed' | 'failed';
+  content?: string | SupadataTranscriptChunk[];
+  lang?: string;
+  availableLangs?: string[];
+  error?: string;
+};
+
 // --- Helper: Clean extracted text ---
 function cleanText(html: string): string {
   return html
@@ -41,6 +72,124 @@ function extractVideoId(url: string): string | null {
 function isYouTubeUrl(url: string): boolean {
   const youtubePattern = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be|m\.youtube\.com)/;
   return youtubePattern.test(url.trim()) || /^[a-zA-Z0-9_-]{11}$/.test(url.trim());
+}
+
+/**
+ * Check if URL is an Instagram post (reel/photo/video)
+ */
+function isInstagramPostUrl(url: string): boolean {
+  const instagramPattern = /^(https?:\/\/)?(www\.)?(instagram\.com|instagr\.am)\/(p|reel|tv)\//i;
+  return instagramPattern.test(url.trim());
+}
+
+/**
+ * Check if URL is an X (Twitter) post
+ */
+function isXPostUrl(url: string): boolean {
+  const xPattern = /^(https?:\/\/)?(www\.)?(x\.com|twitter\.com)\/[^/]+\/status\/\d+/i;
+  return xPattern.test(url.trim());
+}
+
+/**
+ * Poll Supadata transcript job status
+ */
+async function pollSupadataJob(jobId: string, apiKey: string): Promise<SupadataTranscriptResponse> {
+  for (let attempt = 0; attempt < SUPADATA_MAX_POLL_ATTEMPTS; attempt++) {
+    const jobResponse = await axios.get<SupadataJobStatus>(`${SUPADATA_API_BASE_URL}/transcript/${jobId}`, {
+      headers: {
+        'x-api-key': apiKey,
+      },
+    });
+
+    const jobData = jobResponse.data;
+    if (jobData?.status === 'completed' && jobData.content) {
+      return {
+        content: jobData.content,
+        lang: jobData.lang || 'en',
+        availableLangs: jobData.availableLangs || [],
+      };
+    }
+
+    if (jobData?.status === 'failed') {
+      throw new Error(jobData?.error || 'Supadata transcript job failed');
+    }
+
+    // Wait before next poll if not completed yet
+    await new Promise((resolve) => setTimeout(resolve, SUPADATA_POLL_INTERVAL_MS));
+  }
+
+  throw new Error('Supadata transcript is still processing. Please try again later.');
+}
+
+/**
+ * Extract transcript using Supadata for Instagram or X URLs
+ */
+async function extractSupadataTranscript(url: string): Promise<{
+  content: string;
+  title?: string;
+  excerpt?: string;
+  source: 'supadata-transcript';
+  availableLangs?: string[];
+}> {
+  const apiKey = process.env.SUPADATA_API_KEY;
+
+  if (!apiKey) {
+    throw new Error('Supadata API key is not configured. Please set SUPADATA_API_KEY.');
+  }
+
+  let responseData: SupadataTranscriptResponse | SupadataJobResponse;
+
+  try {
+    const response = await axios.get<SupadataTranscriptResponse | SupadataJobResponse>(`${SUPADATA_API_BASE_URL}/transcript`, {
+      params: {
+        url,
+        text: true,
+        mode: 'auto',
+      },
+      headers: {
+        'x-api-key': apiKey,
+      },
+      timeout: 60000,
+    });
+    responseData = response.data;
+  } catch (error) {
+    console.error('Error calling Supadata transcript API:', error);
+    const message =
+      axios.isAxiosError(error) && error.response?.data
+        ? `Failed to fetch transcript from Supadata: ${JSON.stringify(error.response.data)}`
+        : 'Failed to fetch transcript from Supadata';
+    throw new Error(message);
+  }
+
+  // If we got a job ID, poll for the result
+  if ('jobId' in responseData && responseData.jobId) {
+    responseData = await pollSupadataJob(responseData.jobId, apiKey);
+  }
+
+  // At this point, responseData should be SupadataTranscriptResponse
+  // TypeScript needs help understanding this, so we check for content property
+  if (!('content' in responseData)) {
+    throw new Error('Supadata response did not include transcript content');
+  }
+
+  const finalResponse = responseData as SupadataTranscriptResponse;
+  const transcriptContent = typeof finalResponse.content === 'string'
+    ? finalResponse.content
+    : Array.isArray(finalResponse.content)
+      ? finalResponse.content.map((item: SupadataTranscriptChunk) => item.text).join(' ')
+      : null;
+
+  if (!transcriptContent) {
+    throw new Error('Supadata response did not include transcript content');
+  }
+
+  return {
+    content: transcriptContent.trim(),
+    title: 'Supadata Transcript',
+    excerpt: `Transcript fetched via Supadata (${finalResponse.lang || 'unknown language'})`,
+    source: 'supadata-transcript',
+    availableLangs: finalResponse.availableLangs,
+  };
 }
 
 /**
@@ -219,6 +368,8 @@ export async function GET(request: Request) {
     // Check if it's a YouTube URL
     if (isYouTubeUrl(url)) {
       extractedData = await extractYouTubeTranscript(url);
+    } else if (isInstagramPostUrl(url) || isXPostUrl(url)) {
+      extractedData = await extractSupadataTranscript(url);
     } else {
       extractedData = await extractArticleText(url);
     }
@@ -256,6 +407,8 @@ export async function POST(request: Request) {
     // Check if it's a YouTube URL
     if (isYouTubeUrl(url)) {
       extractedData = await extractYouTubeTranscript(url);
+    } else if (isInstagramPostUrl(url) || isXPostUrl(url)) {
+      extractedData = await extractSupadataTranscript(url);
     } else {
       extractedData = await extractArticleText(url);
     }
