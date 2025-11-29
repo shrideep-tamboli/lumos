@@ -3,6 +3,8 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 
+// Sidebar collapsed state
+
 import ClaimsList from '@/components/ClaimsList';
 import InfoDialog from '@/components/InfoDialog';
 import { ReclaimifyResponseViewer } from '@/components/ReclaimifyResponseViewer';
@@ -128,6 +130,7 @@ export default function Home() {
   const [websearchData, setWebsearchData] = useState<{ urlsPerClaim: string[][]; claims: Array<{ claim: string; search_date: string }> } | null>(null);
   const [factCheckResults, setFactCheckResults] = useState<FactCheckResult[]>([]);
   const [batchResults, setBatchResults] = useState<BatchAnalysisResult[]>([]);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
 
   const isProbablyUrl = (value: string): boolean => {
     const v = value.trim();
@@ -966,15 +969,54 @@ export default function Home() {
 
   // Left Sidebar Component
   const leftSidebar = (
-    <div className="h-full flex flex-col">
-      <div className="p-4 border-b border-gray-200">
-        <h2 className="font-bold text-lg text-black">Analysis Steps</h2>
+    <div className={`h-full flex flex-col transition-all duration-300 ${isSidebarCollapsed ? 'w-16' : 'w-full'}`}>
+      <div className="p-4 border-b border-gray-200 flex items-center justify-between">
+        {!isSidebarCollapsed && <h2 className="font-bold text-lg text-black">Analysis Steps</h2>}
+        <button
+          onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+          className="p-1 hover:bg-gray-100 rounded transition-colors"
+          aria-label={isSidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        >
+          <svg 
+            className={`w-5 h-5 text-gray-600 transition-transform duration-300 ${isSidebarCollapsed ? 'rotate-180' : ''}`} 
+            fill="none" 
+            viewBox="0 0 24 24" 
+            stroke="currentColor"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
+          </svg>
+        </button>
       </div>
       <div className="flex-1 overflow-y-auto">
-        <div className="divide-y divide-gray-100">
+        <div className={isSidebarCollapsed ? 'flex flex-col items-center py-2' : 'divide-y divide-gray-100'}>
           {steps.map((step, index) => {
             const isSelected = selectedStep === step.id;
             const canClick = step.isComplete || step.isActive;
+            
+            if (isSidebarCollapsed) {
+              // Collapsed view - show only emojis
+              return (
+                <button 
+                  key={step.id} 
+                  onClick={() => canClick && setSelectedStep(step.id)}
+                  disabled={!canClick}
+                  title={`${index + 1}. ${step.label}`}
+                  className={`w-12 h-12 flex items-center justify-center text-xl transition-all duration-200 my-1 rounded ${
+                    isSelected ? 'bg-blue-100 ring-2 ring-blue-600' : 
+                    canClick ? 'hover:bg-gray-100' : 
+                    'opacity-50 cursor-not-allowed'
+                  }`}
+                >
+                  {step.isActive ? (
+                    <span className="animate-spin h-5 w-5 border-2 border-blue-600 border-t-transparent rounded-full"></span>
+                  ) : (
+                    <span>{step.icon}</span>
+                  )}
+                </button>
+              );
+            }
+            
+            // Expanded view - full content
             return (
               <button 
                 key={step.id} 
@@ -1009,21 +1051,40 @@ export default function Home() {
           })}
         </div>
         
-        {/* Progress indicator */}
-        <div className="p-4 border-t border-gray-200">
-          <div className="text-xs text-gray-500 mb-2">Progress</div>
-          <div className="w-full bg-gray-200 rounded-full h-2">
+        {/* Progress indicator - only show when expanded */}
+        {!isSidebarCollapsed && (
+          <div className="p-4 border-t border-gray-200">
+            <div className="text-xs text-gray-500 mb-2">Progress</div>
+            <div className="w-full bg-gray-200 rounded-full h-2">
+              <div 
+                className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                style={{ 
+                  width: `${(steps.filter(s => s.isComplete).length / steps.length) * 100}%` 
+                }}
+              />
+            </div>
+            <div className="text-xs text-gray-500 mt-1">
+              {steps.filter(s => s.isComplete).length} / {steps.length} steps completed
+            </div>
+          </div>
+        )}
+        
+        {/* Collapsed progress indicator */}
+        {isSidebarCollapsed && (
+          <div className="p-2 border-t border-gray-200">
             <div 
-              className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-              style={{ 
-                width: `${(steps.filter(s => s.isComplete).length / steps.length) * 100}%` 
-              }}
-            />
+              className="w-8 mx-auto bg-gray-200 rounded-full h-1"
+              title={`${steps.filter(s => s.isComplete).length} / ${steps.length} steps completed`}
+            >
+              <div 
+                className="bg-blue-600 h-1 rounded-full transition-all duration-300"
+                style={{ 
+                  width: `${(steps.filter(s => s.isComplete).length / steps.length) * 100}%` 
+                }}
+              />
+            </div>
           </div>
-          <div className="text-xs text-gray-500 mt-1">
-            {steps.filter(s => s.isComplete).length} / {steps.length} steps completed
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );
@@ -1170,6 +1231,7 @@ export default function Home() {
         <ThreeColumnLayout 
           leftSidebar={leftSidebar}
           mainContent={mainContent}
+          isLeftCollapsed={isSidebarCollapsed}
         />
       </main>
       

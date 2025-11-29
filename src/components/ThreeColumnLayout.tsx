@@ -4,17 +4,19 @@ interface ThreeColumnLayoutProps {
   leftSidebar: ReactNode;
   mainContent: ReactNode;
   leftWidth?: string;
+  isLeftCollapsed?: boolean;
 }
 
 export function ThreeColumnLayout({
   leftSidebar,
   mainContent,
   leftWidth = 'w-64',
+  isLeftCollapsed = false,
 }: ThreeColumnLayoutProps) {
   return (
     <div className="flex flex-1 overflow-hidden h-[calc(100vh-64px)]">
       {/* Left Sidebar */}
-      <div className={`${leftWidth} flex-shrink-0 bg-white border-r border-gray-200 overflow-y-auto`}>
+      <div className={`${isLeftCollapsed ? 'w-12' : leftWidth} flex-shrink-0 bg-white border-r border-gray-200 overflow-y-auto transition-all duration-300`}>
         {leftSidebar}
       </div>
       

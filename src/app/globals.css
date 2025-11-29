@@ -33,29 +33,29 @@ body {
 
 /* Add this to your globals.css */
 .analysis-summary {
-  color: #1f2937; /* gray-800 */
+  color: #000000; /* black */
 }
 
 .analysis-summary h3 {
-  color: #111827; /* gray-900 */
+  color: #000000; /* black */
   font-weight: 600;
   margin-bottom: 1rem;
 }
 
 .metric-card {
-  background-color: #f9fafb; /* gray-50 */
+  background-color: #ffffff; /* white */
   padding: 0.75rem;
   border-radius: 0.5rem;
 }
 
 .metric-label {
-  color: #6b7280; /* gray-500 */
+  color: #000000; /* black */
   font-size: 0.875rem;
   margin-bottom: 0.25rem;
 }
 
 .metric-value {
-  color: #111827; /* gray-900 */
+  color: #000000; /* black */
   font-weight: 600;
 }
 
