@@ -109,6 +109,14 @@ function isInstagramPostUrl(url: string): boolean {
 }
 
 /**
+ * Check if URL is specifically an Instagram Reel (video content)
+ */
+function isInstagramReelUrl(url: string): boolean {
+  const reelPattern = /^(https?:\/\/)?(www\.)?(instagram\.com|instagr\.am)\/(reel|tv)\//i;
+  return reelPattern.test(url.trim());
+}
+
+/**
  * Check if URL is an X (Twitter) post
  */
 function isXPostUrl(url: string): boolean {
@@ -168,19 +176,34 @@ async function pollSupadataJob(jobId: string, apiKey: string): Promise<SupadataT
 
 /**
  * Fetch metadata from Supadata (includes caption for Instagram/X posts)
+ * Returns null on errors (including rate limits) so we can fall back gracefully
  */
-async function fetchSupadataMetadata(url: string, apiKey: string): Promise<SupadataMetadataResponse | null> {
+async function fetchSupadataMetadata(url: string, apiKey: string, retryCount = 0): Promise<SupadataMetadataResponse | null> {
+  const MAX_RETRIES = 2;
+  const RETRY_DELAY_MS = 3000;
+  
   try {
+    console.log(`Fetching Supadata metadata for: ${url} (attempt ${retryCount + 1}/${MAX_RETRIES + 1})`);
     const response = await axios.get<SupadataMetadataResponse>(`${SUPADATA_API_BASE_URL}/metadata`, {
       params: { url },
       headers: { 'x-api-key': apiKey },
       timeout: 30000,
     });
+    console.log('Supadata metadata response status:', response.status);
     return response.data;
   } catch (error) {
     if (axios.isAxiosError(error) && error.response?.status === 429) {
       console.error('Supadata metadata API rate limit exceeded (429)');
-      throw new Error('Rate limit exceeded. Please try again in a few minutes.');
+      
+      // Retry on rate limit if we haven't exhausted retries
+      if (retryCount < MAX_RETRIES) {
+        console.log(`Metadata rate limited. Waiting ${RETRY_DELAY_MS}ms before retry ${retryCount + 2}...`);
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        return fetchSupadataMetadata(url, apiKey, retryCount + 1);
+      }
+      
+      console.error('Supadata metadata API rate limit exceeded (429) - all retries exhausted');
+      return null;
     }
     console.error('Error fetching Supadata metadata:', error);
     return null;
@@ -188,10 +211,16 @@ async function fetchSupadataMetadata(url: string, apiKey: string): Promise<Supad
 }
 
 /**
- * Fetch transcript from Supadata (for videos/reels)
+ * Fetch transcript from Supadata (for videos/reels) with retry logic
  */
-async function fetchSupadataTranscript(url: string, apiKey: string): Promise<string | null> {
+async function fetchSupadataTranscript(url: string, apiKey: string, retryCount = 0): Promise<string | null> {
+  const MAX_RETRIES = 2;
+  const RETRY_DELAY_MS = 3000; // 3 seconds between retries
+  
   try {
+    console.log(`Fetching Supadata transcript for: ${url} (attempt ${retryCount + 1}/${MAX_RETRIES + 1})`);
+    console.log('Using API key (first 10 chars):', apiKey?.substring(0, 10) + '...');
+    
     const response = await axios.get<SupadataTranscriptResponse | SupadataJobResponse>(`${SUPADATA_API_BASE_URL}/transcript`, {
       params: {
         url,
@@ -202,14 +231,19 @@ async function fetchSupadataTranscript(url: string, apiKey: string): Promise<str
       timeout: 60000,
     });
 
+    console.log('Supadata transcript response status:', response.status);
+    console.log('Supadata transcript response data:', JSON.stringify(response.data).substring(0, 500));
+
     let responseData = response.data;
 
     // If we got a job ID, poll for the result
     if ('jobId' in responseData && responseData.jobId) {
+      console.log('Got job ID, polling for result:', responseData.jobId);
       responseData = await pollSupadataJob(responseData.jobId, apiKey);
     }
 
     if (!('content' in responseData)) {
+      console.log('No content field in response');
       return null;
     }
 
@@ -220,11 +254,26 @@ async function fetchSupadataTranscript(url: string, apiKey: string): Promise<str
         ? finalResponse.content.map((item: SupadataTranscriptChunk) => item.text).join(' ')
         : null;
 
+    console.log('Transcript content length:', transcriptContent?.length || 0);
     return transcriptContent?.trim() || null;
   } catch (error) {
-    if (axios.isAxiosError(error) && error.response?.status === 429) {
-      console.error('Supadata transcript API rate limit exceeded (429)');
-      // Don't throw here - let metadata still work if available
+    if (axios.isAxiosError(error)) {
+      console.error('Supadata transcript API error:', {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+      });
+      
+      // Retry on rate limit if we haven't exhausted retries
+      if (error.response?.status === 429 && retryCount < MAX_RETRIES) {
+        console.log(`Rate limited. Waiting ${RETRY_DELAY_MS}ms before retry ${retryCount + 2}...`);
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        return fetchSupadataTranscript(url, apiKey, retryCount + 1);
+      }
+      
+      if (error.response?.status === 429) {
+        console.error('Supadata transcript API rate limit exceeded (429) - all retries exhausted');
+      }
     } else {
       console.error('Error fetching Supadata transcript:', error);
     }
@@ -234,7 +283,9 @@ async function fetchSupadataTranscript(url: string, apiKey: string): Promise<str
 
 /**
  * Extract content using Supadata for Instagram or X URLs
- * Combines metadata (caption) + transcript (for videos) for complete content
+ * For Instagram posts/reels with video: prioritize transcript, fallback to caption
+ * For Instagram posts without video: use caption
+ * For X/Twitter: use caption + transcript if available
  */
 async function extractSupadataContent(url: string): Promise<{
   content: string;
@@ -250,13 +301,41 @@ async function extractSupadataContent(url: string): Promise<{
     throw new Error('Supadata API key is not configured. Please set SUPADATA_API_KEY.');
   }
 
-  // Fetch both metadata and transcript in parallel
-  const [metadata, transcript] = await Promise.all([
+  const isInstagram = isInstagramPostUrl(url);
+
+  console.log('Starting parallel fetch for metadata and transcript...');
+  
+  // Use Promise.allSettled so one failure doesn't block the other
+  // This way we can still use transcript even if metadata rate-limits
+  const [metadataResult, transcriptResult] = await Promise.allSettled([
     fetchSupadataMetadata(url, apiKey),
     fetchSupadataTranscript(url, apiKey),
   ]);
 
-  // Build content from available data
+  const metadata = metadataResult.status === 'fulfilled' ? metadataResult.value : null;
+  const transcript = transcriptResult.status === 'fulfilled' ? transcriptResult.value : null;
+
+  if (metadataResult.status === 'rejected') {
+    console.log('Metadata fetch failed:', metadataResult.reason?.message || 'Unknown error');
+  }
+  if (transcriptResult.status === 'rejected') {
+    console.log('Transcript fetch failed:', transcriptResult.reason?.message || 'Unknown error');
+  }
+
+  console.log('Parallel fetch complete:');
+  console.log('  - metadata:', metadata ? 'received' : 'null/failed');
+  console.log('  - transcript:', transcript ? `received (${transcript.length} chars)` : 'null/failed');
+
+  console.log('Supadata fetch results:', {
+    url,
+    hasMetadata: !!metadata,
+    hasTranscript: !!transcript,
+    transcriptLength: transcript?.length || 0,
+    metadataType: metadata?.type,
+    mediaTypes: Array.isArray(metadata?.media) ? metadata.media.map(m => m.type) : 'N/A',
+  });
+
+  // Build content based on what we got
   const contentParts: string[] = [];
   let title = 'Social Media Post';
   let excerpt = '';
@@ -269,22 +348,38 @@ async function extractSupadataContent(url: string): Promise<{
     
     // Caption is in title or description field
     const caption = metadata.title || metadata.description || '';
-    if (caption) {
+
+    // Check if this post has video content (either from media array or if we got a transcript)
+    const hasVideoContent = transcript && transcript.trim().length > 0;
+
+    if (hasVideoContent) {
+      // For posts with video/transcript: prioritize transcript
+      contentParts.push(`Transcript: ${transcript}`);
+      title = `Video Transcript`;
+      excerpt = `Video transcript: ${transcript.substring(0, 150)}...`;
+      
+      // Add caption as additional context if available
+      if (caption) {
+        contentParts.push(`Caption: ${caption}`);
+      }
+      console.log('Using transcript as primary content');
+    } else if (caption) {
+      // For posts without transcript: use caption
       contentParts.push(`Caption: ${caption}`);
       title = caption.substring(0, 100) + (caption.length > 100 ? '...' : '');
       excerpt = caption.substring(0, 200);
+      console.log('Using caption as primary content (no transcript available)');
     }
 
     if (author) {
       excerpt = `@${metadata.author?.username || author}: ${excerpt}`;
     }
-  }
-
-  if (transcript) {
+  } else if (transcript) {
+    // No metadata but have transcript (edge case)
     contentParts.push(`Transcript: ${transcript}`);
-    if (!excerpt) {
-      excerpt = `Video transcript: ${transcript.substring(0, 150)}...`;
-    }
+    title = 'Video Transcript';
+    excerpt = `Video transcript: ${transcript.substring(0, 150)}...`;
+    console.log('Using transcript only (no metadata)');
   }
 
   // If we have no content at all, throw error
@@ -292,11 +387,20 @@ async function extractSupadataContent(url: string): Promise<{
     throw new Error('Could not extract any content (caption or transcript) from this post. The post may be private or unavailable.');
   }
 
+  const finalContent = contentParts.join('\n\n');
+  
+  console.log(`\n========== FINAL CONTENT BEING RETURNED ==========`);
+  console.log(`Has transcript: ${!!transcript}`);
+  console.log(`Has metadata: ${!!metadata}`);
+  console.log(`Content parts count: ${contentParts.length}`);
+  console.log(`Content preview (first 500 chars): ${finalContent.substring(0, 500)}`);
+  console.log(`=================================================\n`);
+
   return {
-    content: contentParts.join('\n\n'),
+    content: finalContent,
     title,
     excerpt,
-    source: metadata ? 'supadata' : 'supadata-transcript',
+    source: transcript ? 'supadata-transcript' : 'supadata',
     author,
     platform,
   };

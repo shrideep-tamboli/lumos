@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 
 type TabType = 'overview' | 'sources' | 'whatsapp' | 'extension';
 
@@ -183,7 +183,7 @@ export default function InfoDialog() {
                   <div className="border-2 border-black p-5 bg-white">
                     <p className="text-sm font-bold uppercase tracking-wider mb-2 text-black">WhatsApp Bot Number</p>
                     <code className="text-3xl font-black text-black">+1 (415) 523-8886</code>
-                    <p className="text-sm text-black mt-2">Save this number to your contacts as "LUMOS Bot"</p>
+                    <p className="text-sm text-black mt-2">Save this number to your contacts as &quot;LUMOS Bot&quot;</p>
                   </div>
 
                   {/* Join Code Box */}
@@ -197,7 +197,7 @@ export default function InfoDialog() {
                     <h3 className="text-lg font-black uppercase tracking-wider mb-6 pb-2 border-b-2 border-black text-black">Setup Guide</h3>
                     <div className="space-y-4">
                       {[
-                        { step: '01', title: 'Save the Bot Number', desc: 'Add the number above to your contacts as "LUMOS Bot"' },
+                        { step: '01', title: 'Save the Bot Number', desc: 'Add the number above to your contacts as LUMOS Bot' },
                         { step: '02', title: 'Join the Sandbox', desc: 'Send "join feature-win" to activate the bot' },
                         { step: '03', title: 'Send Content', desc: 'Forward a message or paste a URL to get fact-check results' },
                       ].map((item) => (
