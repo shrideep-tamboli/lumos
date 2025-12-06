@@ -19,6 +19,11 @@ interface FactCheckViewerProps {
   claims: Array<{ claim: string; search_date: string }>;
   factCheckResults: FactCheckResult[];
   isLoading?: boolean;
+  // Optional: pass searchResults so we can infer source URLs for references
+  // Each item may include: relevantChunks, factCheckSourceUrls, url, content, Reason/Reference, etc.
+  // We keep it as any to remain flexible with upstream shapes
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  searchResults?: any[];
 }
 
 const getVerdictColor = (verdict: string) => {
@@ -46,7 +51,7 @@ const getScoreColor = (score: number) => {
   return 'text-red-600';
 };
 
-export default function FactCheckViewer({ claims, factCheckResults, isLoading }: FactCheckViewerProps) {
+export default function FactCheckViewer({ claims, factCheckResults, isLoading, searchResults = [] }: FactCheckViewerProps) {
   if (!claims || claims.length === 0) {
     return (
       <div className="p-6 text-center text-gray-500">
@@ -60,8 +65,14 @@ export default function FactCheckViewer({ claims, factCheckResults, isLoading }:
   // Calculate stats
   const checkedCount = factCheckResults.length;
   const totalCount = claims.length;
-  const avgScore = checkedCount > 0
-    ? Math.round(factCheckResults.reduce((sum, r) => sum + (r.trustScore || r.Trust_Score || r.trust_score || 0), 0) / checkedCount)
+  
+  // Only include valid numerical scores (exclude null/undefined/NaN)
+  const validScores = factCheckResults
+    .map(r => r.trustScore ?? r.Trust_Score ?? r.trust_score)
+    .filter((score): score is number => typeof score === 'number' && !isNaN(score));
+    
+  const avgScore = validScores.length > 0
+    ? Math.round(validScores.reduce((sum, score) => sum + score, 0) / validScores.length)
     : 0;
 
   return (
@@ -105,6 +116,50 @@ export default function FactCheckViewer({ claims, factCheckResults, isLoading }:
         // Normalize reference to array
         const references = Array.isArray(reference) ? reference : (reference ? [reference] : []);
 
+        // Try to align a searchResult for this claim to infer source URLs
+        const srCandidate = (Array.isArray(searchResults) ? searchResults[index] : undefined) ||
+          searchResults.find((sr) =>
+            (typeof sr?.content === 'string' && sr.content.includes(claimObj.claim)) ||
+            (Array.isArray(sr?.Reference) && sr.Reference.some((t: string) => t && t.includes && t.includes(claimObj.claim)))
+          );
+
+        const relevantChunks = srCandidate?.relevantChunks || [];
+        const fcUrls: string[] = (srCandidate?.factCheckSourceUrls || []).filter((u: unknown): u is string => typeof u === 'string');
+
+        // Helper: find a source URL for a reference text using [Source N], index, or fallbacks
+        const findSourceUrl = (referenceText: string, idx?: number): { url: string; title?: string } | null => {
+          if (typeof referenceText !== 'string') return null;
+          const sourceMatch = referenceText.match(/\[Source (\d+)\]/);
+
+          if (sourceMatch && sourceMatch[1]) {
+            const sourceIndex = parseInt(sourceMatch[1], 10) - 1;
+            if (sourceIndex >= 0) {
+              if (sourceIndex < fcUrls.length && fcUrls[sourceIndex]) {
+                return { url: fcUrls[sourceIndex] };
+              }
+              if (sourceIndex < relevantChunks.length) {
+                const chunk = relevantChunks[sourceIndex];
+                if (chunk?.source?.url) return { url: chunk.source.url, title: chunk.source.title };
+              }
+            }
+          }
+
+          if (typeof idx === 'number' && idx >= 0) {
+            if (idx < fcUrls.length && fcUrls[idx]) return { url: fcUrls[idx] };
+            if (idx < relevantChunks.length) {
+              const chunkAtIdx = relevantChunks[idx];
+              if (chunkAtIdx?.source?.url) return { url: chunkAtIdx.source.url, title: chunkAtIdx.source.title };
+            }
+          }
+
+          if (fcUrls.length > 0) return { url: fcUrls[0] };
+
+          const chunkWithSource = relevantChunks.find((c: any) => c?.source?.url);
+          if (chunkWithSource?.source?.url) return { url: chunkWithSource.source.url, title: chunkWithSource.source.title };
+
+          return null;
+        };
+
         return (
           <div
             key={index}
@@ -115,51 +170,59 @@ export default function FactCheckViewer({ claims, factCheckResults, isLoading }:
             <div className="p-4">
               <div className="flex justify-between items-start">
                 <div className="flex-1 pr-4">
-                  {/* Claim text */}
-                  <p className="text-gray-900 font-medium leading-relaxed">
+                  {/* Claim */}
+                  <div className="text-gray-900 font-semibold leading-relaxed">
                     <span className="inline-flex items-center justify-center w-6 h-6 bg-blue-600 text-white rounded-full text-xs font-bold mr-2">
                       {index + 1}
                     </span>
-                    {claimObj.claim}
-                  </p>
+                    <span className="align-middle">{claimObj.claim}</span>
+                  </div>
 
                   {/* Reason */}
                   {isChecked && reason && (
-                    <p className="mt-3 text-sm text-gray-700">
-                      <span className="font-medium text-gray-900">Reason: </span>
-                      {reason}
-                    </p>
+                    <div className="mt-3">
+                      <div className="text-xs uppercase tracking-wide text-gray-500 mb-1">Reason</div>
+                      <div className="text-sm text-gray-800 bg-gray-50 border border-gray-200 rounded p-3">
+                        {reason}
+                      </div>
+                    </div>
                   )}
 
-                  {/* References */}
+                  {/* References with source URLs */}
                   {isChecked && references.length > 0 && (
-                    <div className="mt-3 text-sm text-gray-600">
-                      <span className="font-medium text-gray-900">References:</span>
-                      <ul className="list-disc list-inside mt-2 space-y-2">
+                    <div className="mt-4">
+                      <div className="text-xs uppercase tracking-wide text-gray-500 mb-2">References</div>
+                      <div className="space-y-2">
                         {references.map((ref, refIndex) => {
-                          // Check if reference is a URL
-                          const isUrl = typeof ref === 'string' && (ref.startsWith('http://') || ref.startsWith('https://'));
-                          
+                          const refText = String(ref ?? '');
+                          const src = findSourceUrl(refText, refIndex);
+                          const cleaned = refText.replace(/\[Source \d+\]\s*/, '');
+                          const inlineUrlMatch = refText.match(/https?:\/\/\S+/);
+                          const directUrl = inlineUrlMatch ? inlineUrlMatch[0] : undefined;
+
                           return (
-                            <li key={refIndex} className="break-words">
-                              <div className="inline">
-                                {isUrl ? (
+                            <div key={refIndex} className="border border-gray-200 rounded p-3 bg-white">
+                              <div className="text-sm text-gray-800 break-words">{cleaned}</div>
+                              {(src?.url || directUrl) && (
+                                <div className="mt-2 flex items-center gap-2 text-xs">
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
+                                    Source
+                                  </span>
                                   <a
-                                    href={ref}
+                                    href={(src?.url || directUrl) as string}
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    className="text-blue-600 hover:text-blue-800 hover:underline break-all"
+                                    className="text-blue-600 hover:underline break-all"
+                                    title={src?.title || 'View source'}
                                   >
-                                    {ref.length > 60 ? `${ref.substring(0, 60)}...` : ref}
+                                    {(src?.url || directUrl) as string}
                                   </a>
-                                ) : (
-                                  <span>{ref}</span>
-                                )}
-                              </div>
-                            </li>
+                                </div>
+                              )}
+                            </div>
                           );
                         })}
-                      </ul>
+                      </div>
                     </div>
                   )}
 
@@ -172,16 +235,18 @@ export default function FactCheckViewer({ claims, factCheckResults, isLoading }:
                   )}
                 </div>
 
-                {/* Score and Verdict */}
+                {/* Verdict and Score */}
                 <div className="ml-4 text-right flex-shrink-0">
                   {isChecked ? (
                     <>
                       <span className={`inline-block px-3 py-1 rounded text-sm font-medium ${getVerdictColor(verdict)}`}>
                         {verdict}
                       </span>
-                      <div className={`mt-2 text-2xl font-bold ${getScoreColor(trustScore)}`}>
-                        {trustScore}
-                      </div>
+                      {typeof trustScore === 'number' && (
+                        <div className={`mt-2 text-2xl font-bold ${getScoreColor(trustScore)}`}>
+                          {trustScore}
+                        </div>
+                      )}
                     </>
                   ) : (
                     <>

@@ -1,6 +1,6 @@
 # WhatsApp Bot Integration
 
-This folder contains the WhatsApp bot integration for Lumous, allowing users to fact-check news articles and text directly through WhatsApp using Twilio.
+This folder contains the WhatsApp bot integration for Lumos, allowing users to fact-check news articles and text directly through WhatsApp using Twilio.
 
 ## Features
 
@@ -42,7 +42,7 @@ BASE_URL=https://lumous.vercel.app
 | `TWILIO_ACCOUNT_SID` | Your Twilio Account SID (found in Twilio Console) | `ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
 | `TWILIO_AUTH_TOKEN` | Your Twilio Auth Token (found in Twilio Console) | `your_auth_token_here` |
 | `TWILIO_WHATSAPP_NUMBER` | Twilio WhatsApp number. For testing, use Twilio's sandbox number. For production, use your purchased WhatsApp-enabled number. | `whatsapp:+14155238886` (sandbox) |
-| `BASE_URL` | Base URL of your Lumous deployment | `https://lumous.vercel.app` |
+| `BASE_URL` | Base URL of your Lumos deployment | `https://lumous.vercel.app` |
 
 > **Note:** The number `+14155238886` shown above is Twilio's shared sandbox number for testing only. For production use, you must purchase a WhatsApp-enabled Twilio number and complete the WhatsApp Business API registration process.
 
@@ -82,7 +82,7 @@ BASE_URL=https://lumous.vercel.app
 ### Response Format
 
 ```
-📊 Lumous Fact Check Results
+📊 Lumos Fact Check Results
 
 📰 Article: [Article Title]
 
@@ -97,7 +97,7 @@ BASE_URL=https://lumous.vercel.app
 2. [Reference 2]
 
 ---
-🌐 Powered by Lumous
+🌐 Powered by Lumos
 📱 lumous.vercel.app
 ```
 

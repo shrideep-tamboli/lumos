@@ -1,4 +1,4 @@
-# Quick Start Guide - Lumous Extension
+# Quick Start Guide - Lumos Extension
 
 ## 🚀 Quick Setup (5 minutes)
 

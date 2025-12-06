@@ -249,7 +249,7 @@ function formatResponse(
   verdictCounts: Record<string, number>,
   claimResults: Array<{ claim: string; verdict: string; score: number; reason: string }>
 ): string {
-  let msg = '📊 *LUMOUS FACT CHECK RESULTS*\n';
+  let msg = '📊 *LUMOS FACT CHECK RESULTS*\n';
   msg += '━━━━━━━━━━━━━━━━━━━━━━\n\n';
   
   if (title) {
@@ -294,7 +294,7 @@ function formatResponse(
   }
   
   msg += '\n━━━━━━━━━━━━━━━━━━━━━━\n';
-  msg += '🌐 _Powered by Lumous_\n';
+  msg += '🌐 _Powered by Lumos_\n';
   msg += '🔗 lumous.vercel.app';
   
   return msg;
@@ -621,7 +621,7 @@ export async function POST(request: Request) {
 export async function GET() {
   return NextResponse.json({ 
     status: 'ok', 
-    message: 'Lumous WhatsApp Bot webhook is active',
+    message: 'Lumos WhatsApp Bot webhook is active',
     timestamp: new Date().toISOString()
   });
 }

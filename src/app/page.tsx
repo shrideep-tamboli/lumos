@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
+import AnalysisSummary from '@/components/AnalysisSummary';
 
 // Sidebar collapsed state
 
@@ -429,6 +430,107 @@ export default function Home() {
 
       // 6. Call fact check with claims and their associated content
       setLoadingState(prev => ({ ...prev, step3: false, step4: true }));
+      // Client-side rate limiter for /api/factCheck
+      const FACTCHECK_REQUESTS_PER_MINUTE = 60;
+      const FACTCHECK_TOKENS_PER_MINUTE = 10000;
+      const FACTCHECK_COOLDOWN_MS = 60000;
+
+      type FCQueueItem<T = unknown> = {
+        run: () => Promise<T>;
+        estimatedTokens: number;
+        resolve: (v: T | PromiseLike<T>) => void;
+        reject: (e?: unknown) => void;
+      };
+
+      // Rate limiter state
+      let fcSchedulerRunning = false;
+      let fcCooldown = false;
+      let fcCooldownTimer: number | null = null;
+      let fcLastRequestTimes: number[] = [];
+      let fcTokenEvents: { ts: number; tokens: number }[] = [];
+      const fcPending: FCQueueItem<unknown>[] = [];
+
+      async function fcScheduleLoop() {
+        if (fcSchedulerRunning) return;
+        fcSchedulerRunning = true;
+        
+        while (fcPending.length > 0) {
+          if (fcCooldown) {
+            await new Promise(r => setTimeout(r, 100));
+            continue;
+          }
+
+          const now = Date.now();
+          const oneMinuteAgo = now - 60000;
+          
+          // Clean up old requests and tokens
+          fcLastRequestTimes = fcLastRequestTimes.filter(t => t > oneMinuteAgo);
+          fcTokenEvents = fcTokenEvents.filter(e => e.ts > oneMinuteAgo);
+          
+          const usedTokens = fcTokenEvents.reduce((s, e) => s + e.tokens, 0);
+          const reqCount = fcLastRequestTimes.length;
+          
+          // Check limits
+          const hitReq = reqCount >= FACTCHECK_REQUESTS_PER_MINUTE;
+          const hitTok = usedTokens >= FACTCHECK_TOKENS_PER_MINUTE;
+          
+          if (hitReq || hitTok) {
+            fcCooldown = true;
+            if (fcCooldownTimer) clearTimeout(fcCooldownTimer);
+            fcCooldownTimer = window.setTimeout(() => {
+              fcCooldown = false;
+              fcLastRequestTimes = [];
+              fcTokenEvents = [];
+            }, FACTCHECK_COOLDOWN_MS);
+            await new Promise(r => setTimeout(r, FACTCHECK_COOLDOWN_MS));
+            continue;
+          }
+
+          let availReq = FACTCHECK_REQUESTS_PER_MINUTE - reqCount;
+          let availTok = FACTCHECK_TOKENS_PER_MINUTE - usedTokens;
+          
+          // Sort by smallest token count first
+          fcPending.sort((a, b) => a.estimatedTokens - b.estimatedTokens);
+          
+          let launched = 0;
+          while (fcPending.length > 0 && availReq > 0) {
+            const item = fcPending[0];
+            if (!item || item.estimatedTokens > availTok) break;
+            
+            fcPending.shift();
+            fcLastRequestTimes.push(now);
+            fcTokenEvents.push({ ts: now, tokens: item.estimatedTokens });
+            
+            availReq--;
+            availTok -= item.estimatedTokens;
+            
+            // Execute the request
+            (async () => {
+              try {
+                const res = await item.run();
+                item.resolve(res);
+              } catch (e) {
+                item.reject(e);
+              }
+            })();
+            
+            launched++;
+          }
+          
+          if (launched === 0) {
+            await new Promise(r => setTimeout(r, 100));
+          }
+        }
+        
+        fcSchedulerRunning = false;
+      }
+
+      function enqueueFactCheck<T>(fn: () => Promise<T>, estimatedTokens: number): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+          fcPending.push({ run: fn, estimatedTokens, resolve: resolve as any, reject });
+          void fcScheduleLoop();
+        });
+      }
 
       let factCheckResultsLocal: FactCheckResult[] = [];
       let averageTrustScore: number | undefined = undefined;
@@ -443,23 +545,27 @@ export default function Home() {
         
         // Create a promise for each claim's fact check
         const factCheckPromises = factCheckClaims.map(claimData => {
-          return fetch('/api/factCheck', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ claims: [claimData] }) // Send one claim at a time
-          })
-          .then(async (r) => {
-            const json = await r.json().catch(() => null);
-            if (!r.ok) {
-              console.error('Failed to perform fact checking for claim:', claimData.claim);
+        const estimatedTokens = 1200; // Rough estimate per request
+          return enqueueFactCheck(() => 
+            fetch('/api/factCheck', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ claims: [claimData] })
+            })
+            .then(async (r) => {
+              const json = await r.json().catch(() => null);
+              if (!r.ok) {
+                console.error('Failed to perform fact checking for claim:', claimData.claim);
+                return null;
+              }
+              return json;
+            })
+            .catch(error => {
+              console.error('Error in fact check request:', error);
               return null;
-            }
-            return json;
-          })
-          .catch(error => {
-            console.error('Error in fact check request:', error);
-            return null;
-          });
+            }),
+            estimatedTokens
+          );
         });
 
         // Bias request (only if we have items)
@@ -489,14 +595,15 @@ export default function Home() {
         setFactCheckResults(factCheckResultsLocal);
         setSelectedStep('factcheck');
 
-        // Calculate average trust score from successful responses
+        // Calculate average trust score from valid responses only
+        // Include only Support (100), Partially Support (50), Refute (0), and Contradict (0)
         const validScores = factCheckResultsLocal
-          .filter(r => typeof r.trustScore === 'number' || typeof r.Trust_Score === 'number')
-          .map(r => (r.trustScore ?? r.Trust_Score) as number); // Type assertion to ensure number[]
+          .map(r => r.trustScore ?? r.Trust_Score ?? r.trust_score)
+          .filter((score): score is number => typeof score === 'number' && !isNaN(score));
 
-        if (validScores.length > 0) {
-          averageTrustScore = validScores.reduce((sum, score) => sum + score, 0) / validScores.length;
-        }
+        averageTrustScore = validScores.length > 0
+          ? Math.round(validScores.reduce((sum, score) => sum + score, 0) / validScores.length)
+          : 0;
 
         // Process bias results if any
         if (requests.length > 0) {
@@ -630,172 +737,6 @@ export default function Home() {
     }
   };
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const searchClaims = async (claimsData: ClaimsResponse, originalUrl: string) => {
-    try {
-      // 1. Get search results
-      setLoadingState((prev: LoadingState) => ({ ...prev, step2: false, step3: true }));
-      
-      const searchResponse = await fetch('/api/websearch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          claims: claimsData.claims,
-          search_date: claimsData.search_date,
-          originalUrl: originalUrl
-        }),
-      });
-      
-      if (!searchResponse.ok) {
-        throw new Error('Failed to search claims');
-      }
-      
-      const { urls } = await searchResponse.json(); // now urls: string[][]
-      if (!urls || !urls.length) return [];
-
-      // Build normalized per-claim url lists and keep per-claim counts to regroup
-      const rawPerClaimUrls: string[][] = urls as string[][];
-      const perClaimUrls: string[][] = rawPerClaimUrls.map(group =>
-        (group || [])
-          .flatMap(u => String(u).split(/[,;\n\r]+/).map(s => s.trim()))
-          .filter(s => s.length > 0)
-      );
-
-      // Deduplicate each group's URLs while preserving order
-      const perClaimUrlsNormalized = perClaimUrls.map(arr => Array.from(new Set(arr)));
-
-      // Flatten and keep only http(s) URLs
-      const flatUrls: string[] = perClaimUrlsNormalized.flat().filter(s => /^https?:\/\//i.test(s));
-      if (flatUrls.length === 0) return [];
-
-      // 2. Extract content from search results (batch)
-      setLoadingState((prev: LoadingState) => ({ ...prev, step3: false, step4: true }));
-      
-      const analyzeResponse = await fetch('/api/analyze/batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          urls: flatUrls
-        }),
-      });
-
-      if (!analyzeResponse.ok) {
-        throw new Error('Failed to analyze search results');
-      }
-
-      // Explicitly type the response to avoid `never` inference and safely access .content
-      interface AnalyzeBatchResult { url?: string | null; content?: string | null; relevantChunks?: RelevantChunk[]; title?: string; excerpt?: string; error?: string; [key: string]: unknown }
-      const analyzeJson = await analyzeResponse.json() as unknown;
-      const rawResults: AnalyzeBatchResult[] = [];
-      if (analyzeJson && typeof analyzeJson === 'object' && 'results' in analyzeJson) {
-        const maybeResults = (analyzeJson as Record<string, unknown>)['results'];
-        if (Array.isArray(maybeResults)) {
-          for (const item of maybeResults) {
-            if (item && typeof item === 'object') rawResults.push(item as AnalyzeBatchResult);
-          }
-        }
-      }
-
-      // Normalize rawResults into SearchResult shape (guarantee url/content are strings)
-      const normalizedResults: SearchResult[] = rawResults.map((r) => ({
-        url: r.url || '',
-        content: r.content || '',
-        title: r.title || undefined,
-        excerpt: r.excerpt || undefined,
-        error: r.error || undefined,
-        relevantChunks: Array.isArray(r.relevantChunks) ? r.relevantChunks as RelevantChunk[] : [],
-      }));
-
-      // results correspond to flatUrls order
-
-      // Regroup results per claim (using normalizedResults)
-      const groupedResults: SearchResult[][] = [];
-      let offset = 0;
-      for (let i = 0; i < perClaimUrls.length; i++) {
-        const count = perClaimUrls[i]?.length || 0;
-        const group = normalizedResults.slice(offset, offset + count);
-        groupedResults.push(group);
-        offset += count;
-      }
-
-      // Update analyzed count (Box 2) after batch analysis
-      // count items that have at least a url or content
-      const analyzedCount = normalizedResults.filter((r) => !!(r && (r.content || r.url))).length;
-      setAnalysisState((prev: AnalysisState) => ({
-        ...prev,
-        analyzedCount: analyzedCount
-      }));
-      
-      // 3. Prepare and log fact-checking request
-      // For each claim, send the extracted contents from up to 3 urls as an array (one per source)
-      const factCheckRequest = {
-        claims: claimsData.claims.map((claim, index) => {
-          const group = groupedResults[index] || [];
-          const contentsArray = group
-            .slice(0, 3)
-            .map((g: SearchResult) => g.content || '');
-          return {
-            claim: claim.claim,
-            content: contentsArray
-          };
-        })
-      };
-      
-      console.log('Sending to /api/factCheck:', JSON.stringify({
-        claimsCount: factCheckRequest.claims.length,
-        sampleClaim: factCheckRequest.claims[0]
-      }, null, 2));
-      
-      // 4. Perform fact-checking and get results with average trust score
-      const factCheckResponse = await fetch('/api/factCheck', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(factCheckRequest),
-      });
-
-      if (!factCheckResponse.ok) {
-        throw new Error('Failed to fact-check results');
-      }
-
-      const { results: factCheckResults, averageTrustScore } = await factCheckResponse.json();
-      
-      // Merge fact-check results into groupedResults (assign verdict/reference/trustScore per claim)
-      const merged: SearchResult[] = groupedResults.map((group, index) => {
-        const fc = (Array.isArray(factCheckResults) && (factCheckResults[index] ||
-                  factCheckResults.find((r: { claim?: string }) => r?.claim === claimsData.claims?.[index]?.claim))) || undefined;
-        // Normalize reference into either `reference` (string) or `Reference` (string[])
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const refAny = (fc as any)?.reference ?? (fc as any)?.Reference;
-        const refString = typeof refAny === 'string' ? refAny : undefined;
-        const refArray = Array.isArray(refAny) ? refAny as string[] : undefined;
-
-        return {
-          ...group[0],
-          relevantChunks: group.flatMap((g: SearchResult & { relevantChunks?: RelevantChunk[] }) => g.relevantChunks || []),
-          factCheckSourceUrls: group.slice(0, 3).map((g: SearchResult) => g.url).filter(Boolean),
-          // Map the fact-check fields to the expected case
-          verdict: fc?.verdict || fc?.Verdict, // Try both cases
-          reason: fc?.reason || fc?.Reason,
-          ...(refString ? { reference: refString } : {}),
-          ...(refArray ? { Reference: refArray } : {}),
-          trustScore: typeof fc?.trustScore === 'number' ? fc.trustScore : 
-                     typeof fc?.Trust_Score === 'number' ? fc.Trust_Score :
-                     typeof fc?.trust_score === 'number' ? fc.trust_score : undefined,
-        } as SearchResult;
-      });
-      
-      // Add the average trust score to the first result
-      if (merged.length > 0) {
-        merged[0].aggregateTrustScore = averageTrustScore;
-      }
-      
-      return merged;
-    } catch (error) {
-      console.error('Error in search, analyze, and fact-check:', error);
-      return [];
-    }
-  };
-
   // Render content based on selected step
   const renderStepContent = () => {
     switch (selectedStep) {
@@ -919,6 +860,7 @@ export default function Home() {
               claims={websearchData?.claims || []}
               factCheckResults={factCheckResults}
               isLoading={loadingState.step4}
+              searchResults={claims?.searchResults as any}
             />
           </div>
         );
@@ -1146,51 +1088,12 @@ export default function Home() {
             </div>
             
             <div className={activeTab === 'summary' ? 'block' : 'hidden'}>
-              <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
-                <div className="p-3 bg-gray-50 border border-gray-200 rounded">
-                  <div className="text-gray-600 text-xs uppercase font-medium">Total Claims</div>
-                  <div className="text-2xl font-bold text-gray-900 mt-1">
-                    {loadingState.step1 ? '...' : analysisState.totalClaims || 0}
-                  </div>
-                </div>
-                <div className="p-3 bg-gray-50 border border-gray-200 rounded">
-                  <div className="text-gray-600 text-xs uppercase font-medium">Avg. Trust Score</div>
-                  <div className="text-2xl font-bold text-blue-600 mt-1">
-                    {typeof analysisState.avgTrustScore === 'number' ? 
-                      analysisState.avgTrustScore.toFixed(2) : '0.00'}
-                  </div>
-                </div>
-                <div className="p-3 bg-gray-50 border border-green-100 rounded">
-                  <div className="text-gray-600 text-xs uppercase font-medium">Support</div>
-                  <div className="text-2xl font-bold text-green-600 mt-1">
-                    {analysisState.verdicts?.support || 0}
-                  </div>
-                </div>
-                <div className="p-3 bg-gray-50 border border-blue-100 rounded">
-                  <div className="text-gray-600 text-xs uppercase font-medium">Partially Support</div>
-                  <div className="text-2xl font-bold text-blue-500 mt-1">
-                    {analysisState.verdicts?.partially || 0}
-                  </div>
-                </div>
-                <div className="p-3 bg-gray-50 border border-yellow-100 rounded">
-                  <div className="text-gray-600 text-xs uppercase font-medium">Unclear</div>
-                  <div className="text-2xl font-bold text-yellow-600 mt-1">
-                    {analysisState.verdicts?.unclear || 0}
-                  </div>
-                </div>
-                <div className="p-3 bg-gray-50 border border-orange-100 rounded">
-                  <div className="text-gray-600 text-xs uppercase font-medium">Contradict</div>
-                  <div className="text-2xl font-bold text-orange-600 mt-1">
-                    {analysisState.verdicts?.contradict || 0}
-                  </div>
-                </div>
-                <div className="p-3 bg-gray-50 border border-red-100 rounded">
-                  <div className="text-gray-600 text-xs uppercase font-medium">Refute</div>
-                  <div className="text-2xl font-bold text-red-600 mt-1">
-                    {analysisState.verdicts?.refute || 0}
-                  </div>
-                </div>
-              </div>
+              <AnalysisSummary 
+                totalClaims={analysisState.totalClaims}
+                avgTrustScore={analysisState.avgTrustScore}
+                verdicts={analysisState.verdicts}
+                isLoading={loadingState.step1}
+              />
             </div>
           </div>
         )} 
@@ -1221,7 +1124,7 @@ export default function Home() {
       {/* Header */}
       <header className="bg-black text-white p-4">
         <div className="container mx-auto">
-          <h1 className="text-2xl font-bold">LUMOUS</h1>
+          <h1 className="text-2xl font-bold">LUMOS</h1>
           <p className="text-sm text-gray-300">Illuminate the truth behind every headline</p>
         </div>
       </header>

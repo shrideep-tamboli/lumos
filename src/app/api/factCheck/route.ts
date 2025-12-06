@@ -1,7 +1,5 @@
 import { NextResponse } from 'next/server';
 import { GoogleGenAI } from "@google/genai";
-import { groq } from '@ai-sdk/groq';
-import { generateObject } from 'ai';
 import { z } from 'zod';
 
 const ai = new GoogleGenAI({
@@ -15,16 +13,46 @@ const factCheckSchema = z.union([
     Verdict: z.enum(["Support", "Partially Support", "Unclear", "Contradict", "Refute"]),
     Reason: z.string().min(1).max(600),
     Reference: z.array(z.string()).min(0).max(3),
-    Trust_Score: z.number().min(-100).max(100)
-  }),
+    Trust_Score: z.union([
+      z.literal(0),
+      z.literal(50),
+      z.literal(100)
+    ]).nullable().optional()
+  }).refine(
+    (data) => {
+      if (data.Verdict === 'Support') return data.Trust_Score === 100;
+      if (data.Verdict === 'Partially Support') return data.Trust_Score === 50;
+      if (['Unclear', 'Contradict', 'Refute'].includes(data.Verdict)) return data.Trust_Score === 0 || data.Trust_Score === null;
+      return true;
+    },
+    {
+      message: 'Verdict and Trust_Score combination is invalid',
+      path: ['Trust_Score']
+    }
+  ),
   z.array(
     z.object({
       claim: z.string(),
       Verdict: z.enum(["Support", "Partially Support", "Unclear", "Contradict", "Refute"]),
       Reason: z.string().min(1).max(600),
       Reference: z.array(z.string()).min(0).max(3),
-      Trust_Score: z.number().min(-100).max(100)
-    })
+      Trust_Score: z.union([
+        z.literal(0),
+        z.literal(50),
+        z.literal(100)
+      ]).nullable().optional()
+    }).refine(
+      (data) => {
+        if (data.Verdict === 'Support') return data.Trust_Score === 100;
+        if (data.Verdict === 'Partially Support') return data.Trust_Score === 50;
+        if (['Unclear', 'Contradict', 'Refute'].includes(data.Verdict)) return data.Trust_Score === 0 || data.Trust_Score === null;
+        return true;
+      },
+      {
+        message: 'Verdict and Trust_Score combination is invalid',
+        path: ['Trust_Score']
+      }
+    )
   )
 ]);
 
@@ -35,12 +63,9 @@ interface EmbeddingResponse { embeddings: EmbeddingValue[]; }
 const MAX_RETRIES = 3; // Maximum number of retries for a failed request
 const INITIAL_RETRY_DELAY = 1000; // Initial retry delay in ms
 const MAX_RETRY_DELAY = 60000; // Maximum retry delay in ms (1 minute)
-const TOKENS_PER_MINUTE_LIMIT = 10000; // API limit: 10k tokens per minute
-const REQUESTS_PER_MINUTE_LIMIT = 60; // API limit: 60 requests per minute
 
-// Add these new variables at the top with other rate limiting variables
-let lastRequestTimes: number[] = []; // For tracking request rate
-let tokenEvents: { ts: number; tokens: number }[] = []
+// Model type for rate limiting
+type ModelType = 'moonshot' | 'gemini-embedding';
 
 // Helper function to create a promise that rejects after a timeout
 function timeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -67,6 +92,7 @@ let schedulerRunning = false;
 interface QueueItem<T = unknown> {
   run: () => Promise<T>;
   estimatedTokens: number;
+  model: ModelType;
   resolve: (value: T | PromiseLike<T>) => void;
   reject: (reason?: unknown) => void;
 }
@@ -74,69 +100,11 @@ interface QueueItem<T = unknown> {
 // Array to hold pending queue items
 const pendingQueue: QueueItem<unknown>[] = [];
 
-async function scheduleLoop() {
-  if (schedulerRunning) return;
-  schedulerRunning = true;
-  while (pendingQueue.length > 0) {
-    const now = Date.now();
-    lastRequestTimes = lastRequestTimes.filter(t => now - t < 60000);
-    tokenEvents = tokenEvents.filter(e => now - e.ts < 60000);
-    const tokensUsed = tokenEvents.reduce((s, e) => s + e.tokens, 0);
-    let reqSlots = Math.max(0, REQUESTS_PER_MINUTE_LIMIT - lastRequestTimes.length);
-    let tokenBudget = Math.max(0, TOKENS_PER_MINUTE_LIMIT - tokensUsed);
 
-    pendingQueue.sort((a, b) => a.estimatedTokens - b.estimatedTokens);
 
-    let launched = 0;
-    while (pendingQueue.length > 0 && reqSlots > 0) {
-      const next = pendingQueue[0];
-      if (next && next.estimatedTokens <= tokenBudget) {
-        const item = pendingQueue.shift();
-        if (item) {
-          reqSlots -= 1;
-          tokenBudget -= item.estimatedTokens;
-          lastRequestTimes.push(now);
-          tokenEvents.push({ ts: now, tokens: item.estimatedTokens });
-          (async () => {
-            try {
-              const res = await withRetry(item.run);
-              item.resolve(res);
-            } catch (e) {
-              item.reject(e);
-            }
-          })();
-          launched += 1;
-        } else {
-          break;
-        }
-      } else {
-        break;
-      }
-    }
-
-    if (launched === 0) {
-      const nextReqWait = lastRequestTimes.length >= REQUESTS_PER_MINUTE_LIMIT ? Math.max(0, 60000 - (now - lastRequestTimes[0])) : 0;
-      const nextTokWait = tokenEvents.length > 0 ? Math.max(0, 60000 - (now - tokenEvents[0].ts)) : 0;
-      const waitTime = Math.max(nextReqWait, nextTokWait, 10);
-      await new Promise(r => setTimeout(r, waitTime));
-    } else {
-      await new Promise(r => setTimeout(r, 0));
-    }
-  }
-  schedulerRunning = false;
-}
-
-function enqueueRateLimited<T>(fn: () => Promise<T>, estimatedTokens: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const queueItem: QueueItem<T> = {
-      run: fn,
-      estimatedTokens,
-      resolve: (value: T | PromiseLike<T>) => resolve(value),
-      reject: (reason?: unknown) => reject(reason)
-    };
-    (pendingQueue as QueueItem<T>[]).push(queueItem);
-    void scheduleLoop();
-  });
+function enqueueRateLimited<T>(fn: () => Promise<T>, estimatedTokens: number, model: ModelType = 'moonshot'): Promise<T> {
+  // Server-side rate limiting disabled: execute immediately
+  return fn();
 }
 
 async function withRetry<T>(
@@ -222,15 +190,34 @@ async function withRetry<T>(
   }
 }
 
+let isOutOfQuota = false;
+let quotaResetTime: number | null = null;
+
 async function generateEmbedding(text: string): Promise<number[]> {
   if (!text.trim()) return [];
+  
+  // Check if we're out of quota
+  if (isOutOfQuota && quotaResetTime && Date.now() < quotaResetTime) {
+    console.warn('Embedding API quota exhausted. Please check your billing status.');
+    return [];
+  } else if (isOutOfQuota) {
+    // Reset the quota flag if the reset time has passed
+    isOutOfQuota = false;
+    quotaResetTime = null;
+  }
+
+  // Estimate tokens (roughly 1 token = 4 characters in English)
+  const estimatedTokens = Math.ceil(text.length / 4);
+  
   try {
-    //console.log(`Generating embedding for text (${text.length} chars)`);
-    //await rateLimit();
-    const resp = await timeout(ai.models.embedContent({ 
-      model: "text-embedding-004", 
-      contents: text 
-    }), 30000) as EmbeddingResponse; // 30s timeout for embedding
+    const resp = await enqueueRateLimited<EmbeddingResponse>(
+      () => ai.models.embedContent({ 
+        model: "text-embedding-004", 
+        contents: text 
+      }) as Promise<EmbeddingResponse>,
+      estimatedTokens,
+      'gemini-embedding'
+    );
     
     const vals = resp.embeddings?.[0]?.values;
     if (!Array.isArray(vals)) {
@@ -239,7 +226,17 @@ async function generateEmbedding(text: string): Promise<number[]> {
     }
     return vals;
   } catch (error) {
-    console.error('Error generating embedding:', error instanceof Error ? error.message : 'Unknown error');
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('Error generating embedding:', errorMessage);
+    
+    // Check for quota exceeded error
+    if (errorMessage.includes('quota') || errorMessage.includes('Quota')) {
+      isOutOfQuota = true;
+      // Set reset time to 1 hour from now (adjust based on your quota reset period)
+      quotaResetTime = Date.now() + 3600000; // 1 hour in milliseconds
+      console.warn('Embedding API quota exhausted. Will retry after:', new Date(quotaResetTime).toISOString());
+    }
+    
     return [];
   }
 }
@@ -390,11 +387,18 @@ Strictly output a JSON array where each element has these keys:
 - claim: The original claim text
 - Verdict: One of ["Support","Partially Support","Unclear","Contradict","Refute"]
 - Reason: Short textual justification for the verdict referencing the evidence
-- Reference: Array of 1-3 exact quotes from the evidence (include source numbers like [Source 1])
+- Reference: Array of 1-3 exact quotes from the evidence (include source numbers like [Source 1] OR [Source 2] etc.)
 - Trust_Score: Number based on evidence strength
   - 100: Support (claim is fully supported by evidence)
   - 50: Partially Support (claim is partially supported by evidence)
-  - 0: Unclear/Contradict/Refute (insufficient or contradictory evidence, or evidence refutes the claim)
+  - 0: Contradict/Refute (evidence contradicts or refutes the claim)
+  - null: Unclear (insufficient evidence to make a determination)
+
+IMPORTANT: The Trust_Score MUST be set to exactly:
+- 100 for 'Support' verdict
+- 50 for 'Partially Support' verdict
+- 0 for 'Contradict' or 'Refute' verdicts
+- null for 'Unclear' verdict (this will be excluded from average calculation)
 
 Format example:
 [
@@ -402,7 +406,7 @@ Format example:
     "claim": "Example claim",
     "Verdict": "Support",
     "Reason": "Explain which sources support the verdict.",
-    "Reference": ["[Source 1] Supporting evidence quote."],
+    "Reference": ["[Source 1] OR [Source 2] etc Supporting evidence quote."],
     "Trust_Score": 100
   }
 ]`;
@@ -425,13 +429,18 @@ Format example:
         // Estimate tokens (roughly 1 token = 4 chars for English text)
         const estimatedTokens = Math.min(1200, Math.ceil(batchPrompt.length / 4));
         
-        // Queue the request to respect RPM and TPM
+        // Queue the request
         const result = await enqueueRateLimited(async () => {
-          return await generateObject({
-            model: groq('moonshotai/kimi-k2-instruct-0905'),
-            schema: factCheckSchema,
-            prompt: batchPrompt,
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash-lite",
+            contents: batchPrompt,
+            config: {
+              responseMimeType: "application/json",
+            },
           });
+          const parsed = JSON.parse(response.text || 'null');
+          const validated = factCheckSchema.parse(parsed);
+          return { object: validated } as { object: unknown };
         }, estimatedTokens);
 
         try {
@@ -453,21 +462,26 @@ Format example:
             Verdict: "Unclear",
             Reason: "Error processing claim",
             Reference: ["Error processing claim"],
-            Trust_Score: 0
+            Trust_Score: null
           });
         });
       }
     }
 
-    // Calculate average trust score (excluding Unclear verdicts)
+    // Calculate average trust score (excluding Unclear verdicts and null scores)
     const validScores = batchResults.filter(r => 
+      r.Trust_Score !== null && 
+      r.Trust_Score !== undefined && 
+      r.Verdict !== 'Unclear' &&
       typeof r.Trust_Score === 'number' && 
-      !isNaN(r.Trust_Score) && 
-      r.Verdict !== 'Unclear'
+      !isNaN(r.Trust_Score)
     );
     const averageTrustScore = validScores.length > 0 
-      ? Math.round(validScores.reduce((sum, r) => sum + r.Trust_Score, 0) / validScores.length)
-      : 0;
+      ? Math.round(validScores.reduce((sum, r) => {
+        const score = r.Trust_Score;
+        return typeof score === 'number' ? sum + score : sum;
+      }, 0) / validScores.length)
+      : null;
 
     const duration = Date.now() - startTime;
     console.log(`[${requestId}] Completed fact-check in ${duration}ms`);
