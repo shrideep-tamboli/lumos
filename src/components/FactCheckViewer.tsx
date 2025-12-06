@@ -1,6 +1,8 @@
 'use client';
 
 import React from 'react';
+import { RelevantChunk } from '@/types';
+import { SearchResult } from '@/types'; 
 
 interface FactCheckResult {
   claim: string;
@@ -19,11 +21,7 @@ interface FactCheckViewerProps {
   claims: Array<{ claim: string; search_date: string }>;
   factCheckResults: FactCheckResult[];
   isLoading?: boolean;
-  // Optional: pass searchResults so we can infer source URLs for references
-  // Each item may include: relevantChunks, factCheckSourceUrls, url, content, Reason/Reference, etc.
-  // We keep it as any to remain flexible with upstream shapes
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  searchResults?: any[];
+  searchResults?: SearchResult[];  // Update the type here
 }
 
 const getVerdictColor = (verdict: string) => {
@@ -154,7 +152,7 @@ export default function FactCheckViewer({ claims, factCheckResults, isLoading, s
 
           if (fcUrls.length > 0) return { url: fcUrls[0] };
 
-          const chunkWithSource = relevantChunks.find((c: any) => c?.source?.url);
+          const chunkWithSource = relevantChunks.find((c: RelevantChunk) => c?.source?.url);
           if (chunkWithSource?.source?.url) return { url: chunkWithSource.source.url, title: chunkWithSource.source.title };
 
           return null;

@@ -59,135 +59,9 @@ const factCheckSchema = z.union([
 interface EmbeddingValue { values: number[]; }
 interface EmbeddingResponse { embeddings: EmbeddingValue[]; }
 
-// Rate limiting and retry configuration
-const MAX_RETRIES = 3; // Maximum number of retries for a failed request
-const INITIAL_RETRY_DELAY = 1000; // Initial retry delay in ms
-const MAX_RETRY_DELAY = 60000; // Maximum retry delay in ms (1 minute)
-
-// Model type for rate limiting
-type ModelType = 'moonshot' | 'gemini-embedding';
-
-// Helper function to create a promise that rejects after a timeout
-function timeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`Request timed out after ${ms}ms`));
-    }, ms);
-
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      }
-    );
-  });
-}
-
-let schedulerRunning = false;
-
-interface QueueItem<T = unknown> {
-  run: () => Promise<T>;
-  estimatedTokens: number;
-  model: ModelType;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-}
-
-// Array to hold pending queue items
-const pendingQueue: QueueItem<unknown>[] = [];
-
-
-
-function enqueueRateLimited<T>(fn: () => Promise<T>, estimatedTokens: number, model: ModelType = 'moonshot'): Promise<T> {
+function enqueueRateLimited<T>(fn: () => Promise<T>): Promise<T> {
   // Server-side rate limiting disabled: execute immediately
   return fn();
-}
-
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  retries = MAX_RETRIES,
-  delay = INITIAL_RETRY_DELAY
-): Promise<T> {
-  try {
-    return await fn();
-  } catch (error: unknown) {
-    if (retries <= 0) {
-      throw error;
-    }
-
-    // Define interfaces for error types
-    interface ErrorWithMessage {
-      message: string;
-      [key: string]: unknown;
-    }
-
-    interface ErrorWithResponse {
-      response: {
-        status: number;
-        headers?: Record<string, unknown>;
-        [key: string]: unknown;
-      };
-      [key: string]: unknown;
-    }
-
-    // Type guard for error with message
-    const isErrorWithMessage = (e: unknown): e is ErrorWithMessage => {
-      return typeof e === 'object' && e !== null && 'message' in e && 
-             typeof (e as ErrorWithMessage).message === 'string';
-    };
-
-    // Type guard for error with response
-    const isErrorWithResponse = (e: unknown): e is ErrorWithResponse => {
-      if (typeof e !== 'object' || e === null) return false;
-      const error = e as ErrorWithResponse;
-      return 'response' in error && 
-             typeof error.response === 'object' && 
-             error.response !== null && 
-             'status' in error.response;
-    };
-
-    // Check for rate limit error
-    const isRateLimitError = 
-      (isErrorWithMessage(error) && error.message.includes('Rate limit reached')) ||
-      (isErrorWithResponse(error) && error.response.status === 429);
-
-    if (isRateLimitError) {
-      let retryAfter = delay;
-      if (isErrorWithResponse(error)) {
-        const headers = error.response.headers as Record<string, unknown> | undefined;
-        if (headers) {
-          if ('retry-after' in headers) {
-            retryAfter = typeof headers['retry-after'] === 'number' 
-              ? headers['retry-after'] 
-              : delay;
-          } else if ('x-ratelimit-reset-tokens' in headers) {
-            retryAfter = typeof headers['x-ratelimit-reset-tokens'] === 'number'
-              ? headers['x-ratelimit-reset-tokens']
-              : delay;
-          }
-        }
-      }
-      
-      const waitTime = Math.min(
-        retryAfter * 1000,
-        MAX_RETRY_DELAY
-      );
-      
-      console.log(`Rate limited. Retrying in ${waitTime}ms... (${retries} retries left)`);
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-      return withRetry(fn, retries - 1, Math.min(delay * 2, MAX_RETRY_DELAY));
-    }
-
-    // For other errors, use exponential backoff
-    const errorMessage = isErrorWithMessage(error) ? error.message : 'Unknown error';
-    console.log(`Error: ${errorMessage}. Retrying in ${delay}ms... (${retries} retries left)`);
-    await new Promise(resolve => setTimeout(resolve, delay));
-    return withRetry(fn, retries - 1, Math.min(delay * 2, MAX_RETRY_DELAY));
-  }
 }
 
 let isOutOfQuota = false;
@@ -205,9 +79,6 @@ async function generateEmbedding(text: string): Promise<number[]> {
     isOutOfQuota = false;
     quotaResetTime = null;
   }
-
-  // Estimate tokens (roughly 1 token = 4 characters in English)
-  const estimatedTokens = Math.ceil(text.length / 4);
   
   try {
     const resp = await enqueueRateLimited<EmbeddingResponse>(
@@ -215,8 +86,6 @@ async function generateEmbedding(text: string): Promise<number[]> {
         model: "text-embedding-004", 
         contents: text 
       }) as Promise<EmbeddingResponse>,
-      estimatedTokens,
-      'gemini-embedding'
     );
     
     const vals = resp.embeddings?.[0]?.values;
@@ -426,9 +295,6 @@ Format example:
       try {
         console.log(`[${requestId}] Processing batch ${i / BATCH_SIZE + 1} of ${Math.ceil(perClaimChunks.length / BATCH_SIZE)}`);
         
-        // Estimate tokens (roughly 1 token = 4 chars for English text)
-        const estimatedTokens = Math.min(1200, Math.ceil(batchPrompt.length / 4));
-        
         // Queue the request
         const result = await enqueueRateLimited(async () => {
           const response = await ai.models.generateContent({
@@ -441,7 +307,7 @@ Format example:
           const parsed = JSON.parse(response.text || 'null');
           const validated = factCheckSchema.parse(parsed);
           return { object: validated } as { object: unknown };
-        }, estimatedTokens);
+        });
 
         try {
           const normalizedResults = Array.isArray(result.object) 

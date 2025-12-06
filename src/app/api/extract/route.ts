@@ -109,14 +109,6 @@ function isInstagramPostUrl(url: string): boolean {
 }
 
 /**
- * Check if URL is specifically an Instagram Reel (video content)
- */
-function isInstagramReelUrl(url: string): boolean {
-  const reelPattern = /^(https?:\/\/)?(www\.)?(instagram\.com|instagr\.am)\/(reel|tv)\//i;
-  return reelPattern.test(url.trim());
-}
-
-/**
  * Check if URL is an X (Twitter) post
  */
 function isXPostUrl(url: string): boolean {
@@ -300,8 +292,6 @@ async function extractSupadataContent(url: string): Promise<{
   if (!apiKey) {
     throw new Error('Supadata API key is not configured. Please set SUPADATA_API_KEY.');
   }
-
-  const isInstagram = isInstagramPostUrl(url);
 
   console.log('Starting parallel fetch for metadata and transcript...');
   

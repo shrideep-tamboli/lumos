@@ -1,12 +1,7 @@
 'use client';
 
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { v4 as uuidv4 } from 'uuid';
+import { useState } from 'react';
 import AnalysisSummary from '@/components/AnalysisSummary';
-
-// Sidebar collapsed state
-
-import ClaimsList from '@/components/ClaimsList';
 import InfoDialog from '@/components/InfoDialog';
 import { ReclaimifyResponseViewer } from '@/components/ReclaimifyResponseViewer';
 import { ThreeColumnLayout } from '@/components/ThreeColumnLayout';
@@ -144,7 +139,6 @@ export default function Home() {
     if (/^[^\s]+\.[^\s]{2,}(\/|$)/.test(v)) return true;
     try {
       // new URL will throw for plain text
-      // eslint-disable-next-line no-new
       new URL(v.startsWith('http') ? v : `https://${v}`);
       return true;
     } catch {
@@ -438,8 +432,8 @@ export default function Home() {
       type FCQueueItem<T = unknown> = {
         run: () => Promise<T>;
         estimatedTokens: number;
-        resolve: (v: T | PromiseLike<T>) => void;
-        reject: (e?: unknown) => void;
+        resolve: (value: T) => void;
+        reject: (reason?: unknown) => void;
       };
 
       // Rate limiter state
@@ -527,7 +521,16 @@ export default function Home() {
 
       function enqueueFactCheck<T>(fn: () => Promise<T>, estimatedTokens: number): Promise<T> {
         return new Promise<T>((resolve, reject) => {
-          fcPending.push({ run: fn, estimatedTokens, resolve: resolve as any, reject });
+          // Create a properly typed item
+          const item: FCQueueItem<T> = {
+            run: fn,
+            estimatedTokens,
+            resolve,
+            reject
+          };
+          
+          // Cast to unknown first, then to FCQueueItem<unknown>
+          fcPending.push(item as unknown as FCQueueItem<unknown>);
           void fcScheduleLoop();
         });
       }
@@ -579,7 +582,7 @@ export default function Home() {
               const json = await r.json().catch(() => null);
               if (!r.ok) throw new Error('Failed to classify opinions');
               return json;
-            }).catch((e) => {
+            }).catch(() => {
               return null;
             })
           );
@@ -860,7 +863,7 @@ export default function Home() {
               claims={websearchData?.claims || []}
               factCheckResults={factCheckResults}
               isLoading={loadingState.step4}
-              searchResults={claims?.searchResults as any}
+              searchResults={claims?.searchResults}
             />
           </div>
         );
